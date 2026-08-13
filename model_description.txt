@@ -1,0 +1,27 @@
+DEFOM Stereo 模型维护日志
+================================================================================
+
+[2026-07-25]
+
+1. 模型只使用 1/4 分辨率特征。Depth Anything V2 提供双目特征和左图
+   单目视差；fnet 输出 64 通道，low_channel 压缩为 32 通道。
+
+2. 初始视差由行方向 FullCorr 全局匹配得到。FullCorr 使用全局 GT 分类
+   损失监督，局部 soft-argmax 和动态采样共用 corr_radius=4。
+
+3. 删除原 GWC 5D 代价体和 3D 聚合，改为动态 GWC。右特征包含
+   W、W/2、W/4 三个宽度尺度，每尺度采样 9 点，共 27 点。
+
+4. 当前 dynamic_gwc_groups=4，每组 8 通道，dynamic_corr 共 108 通道；
+   单轮对应原图的最大搜索范围为 +/-64 px。
+
+5. MotionEncoder 融合 dynamic_corr、当前视差和动态匹配特征，再与单目
+   结构先验共同输入单层 GRU，迭代更新视差。
+
+6. 总损失为 sequence_loss_d0L1_edge + 0.1 * FullCorr 分类损失。
+   训练和 SceneFlow 验证的最大 GT 视差均为 768 px。
+
+7. 当前训练配置：ViT-L、2 GPU、batch size 4、18 次迭代、250000 steps、
+   learning rate 0.00025、mixed precision。
+
+后续修改请按日期追加，不覆盖历史记录。

@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs
+*.log
+*.out
+nohup.out
+nohup*.out
+
+# Model weights / checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
+
+# Training / inference outputs
+output/
+outputs/
+output_images/
+runs/
+wandb/
+tensorboard/
+tb_logs/
+logs/
+
+# Temporary visualization / generated artifacts
+*.tmp
+*.temp

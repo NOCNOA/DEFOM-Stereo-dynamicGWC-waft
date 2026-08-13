@@ -1,0 +1,55 @@
+{
+  "root": "/home/share/yijiayi/sceneflow",
+  "view": "left",
+  "bucket_semantics": "finite, non-negative pixels; lower-inclusive and upper-exclusive",
+  "splits": {
+    "train": {
+      "images": 35454,
+      "images_by_subset": {
+        "Driving": 4400,
+        "FlyingThings3D": 22390,
+        "Monkaa": 8664
+      },
+      "valid_pixels": 18379353595,
+      "bucket_counts": {
+        "[0,192)": 17678793112,
+        "[192,384)": 623586437,
+        "[384,512)": 48304861,
+        "[512,768)": 16088564,
+        "[768,inf)": 12580621
+      },
+      "bucket_percentages": {
+        "[0,192)": 96.18832904335339,
+        "[192,384)": 3.3928638119767345,
+        "[384,512)": 0.2628213269325264,
+        "[512,768)": 0.08753607093329334,
+        "[768,inf)": 0.06844974680405783
+      },
+      "negative_pixels": 5,
+      "nonfinite_pixels": 0
+    },
+    "test": {
+      "images": 4370,
+      "images_by_subset": {
+        "FlyingThings3D": 4370
+      },
+      "valid_pixels": 2265408000,
+      "bucket_counts": {
+        "[0,192)": 2239440712,
+        "[192,384)": 21536670,
+        "[384,512)": 1764558,
+        "[512,768)": 1097863,
+        "[768,inf)": 1568197
+      },
+      "bucket_percentages": {
+        "[0,192)": 98.85374784586264,
+        "[192,384)": 0.9506751101788287,
+        "[384,512)": 0.0778913996948894,
+        "[512,768)": 0.048462043040370655,
+        "[768,inf)": 0.06922360122326751
+      },
+      "negative_pixels": 0,
+      "nonfinite_pixels": 0
+    }
+  }
+}

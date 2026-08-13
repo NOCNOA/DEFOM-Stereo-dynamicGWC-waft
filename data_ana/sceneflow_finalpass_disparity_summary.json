@@ -1,0 +1,24 @@
+{
+  "root": "/home/share/yijiayi/sceneflow",
+  "view": "left",
+  "comparison": "strictly less than threshold",
+  "total_images": 39824,
+  "images_by_subset": {
+    "Driving": 4400,
+    "FlyingThings3D": 26760,
+    "Monkaa": 8664
+  },
+  "cumulative_counts": {
+    "192": 31496,
+    "384": 38772,
+    "512": 39433,
+    "768": 39700
+  },
+  "bucket_counts": {
+    "[0,192)": 31496,
+    "[192,384)": 7276,
+    "[384,512)": 661,
+    "[512,768)": 267,
+    "[768,inf)": 124
+  }
+}
