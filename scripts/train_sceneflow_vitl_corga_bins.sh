@@ -1,22 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0
-CHECKPOINT_DIR=checkpoints/defomstereo_vitl_corga_bins_48_avg
-LATEST_CKPT=${CHECKPOINT_DIR}/checkpoint_latest.pth
-if [[ -s "${LATEST_CKPT}" ]]; then
-    RESUME_ARGS=(--resume_ckpt "${LATEST_CKPT}" --strict_resume)
-else
-    RESUME_ARGS=()
-fi
+MODE="${1:-fresh}"
+EXPERIMENT_NAME="defomstereo_vitl_corga_bins_no_rope"
+CHECKPOINT_DIR="checkpoints/${EXPERIMENT_NAME}"
+LATEST_CKPT="${CHECKPOINT_DIR}/checkpoint_latest.pth"
+
+case "${MODE}" in
+    fresh)
+        if [[ -e "${LATEST_CKPT}" ]]; then
+            echo "Refusing to start fresh: ${LATEST_CKPT} already exists." >&2
+            echo "Run with 'resume' to continue this fixed experiment." >&2
+            exit 1
+        fi
+        RESUME_ARGS=()
+        ;;
+    resume)
+        if [[ ! -s "${LATEST_CKPT}" ]]; then
+            echo "Cannot resume: ${LATEST_CKPT} does not exist or is empty." >&2
+            exit 1
+        fi
+        RESUME_ARGS=(--resume_ckpt "${LATEST_CKPT}" --strict_resume)
+        ;;
+    *)
+        echo "Usage: $0 [fresh|resume]" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p "${CHECKPOINT_DIR}"
-python train_stereo.py \
---model_arch cor_ga_bins \
+echo "mode=${MODE} experiment=${EXPERIMENT_NAME} gpu=0"
+CUDA_VISIBLE_DEVICES=0 python train_stereo.py \
+--model_arch cor_ga_bins2 \
 --launcher none \
 --gpu_ids 0 \
---name defomstereo_vitl_corga_bins_48_avg \
---batch_size 1 \
+--name "${EXPERIMENT_NAME}" \
+--batch_size 2 \
 --num_workers 2 \
 --train_datasets sceneflow \
 --train_folds 1 \
@@ -40,8 +59,20 @@ python train_stereo.py \
 --corr_levels 3 \
 --corr_radius 4 \
 --dinov2_encoder vitl \
+--init_right_compression avg \
+--refine_right_compression avg \
+--context_norm batch \
+--n_gru_layers 3 \
+--hidden_dims 128 \
+--image_size 256 768 \
+--wdecay 0.00001 \
+--seed 1234565 \
+--val_freq 10000 \
+--valid_iters 32 \
+--amp_dtype fp16 \
 "${RESUME_ARGS[@]}" \
 --mixed_precision \
+--debug_nan \
 --amp_init_scale 64 \
 --lr 0.00020 \
 2>&1 | tee -a "${CHECKPOINT_DIR}/train.log"

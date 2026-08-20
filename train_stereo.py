@@ -17,6 +17,9 @@ from torch.utils.data import DataLoader
 
 from utils.dist_utils import get_dist_info, init_dist, setup_for_distributed
 from utils.utils import *
+from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
+from core.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitEdgeStereo
+from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
 from core.defom_cor_ga import DEFOMStereo as CorGAStereo
 from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
 #from core.defom_GRU_2multi import DEFOMStereo
@@ -27,59 +30,59 @@ import core.stereo_datasets as datasets
 
 try:
     from torch.amp import GradScaler
+    GRAD_SCALER_HAS_DEVICE_ARG = True
 except ImportError:
-    # dummy GradScaler for PyTorch < 1.6
-    class GradScaler:
-        def __init__(self, device='cuda', enabled=False, init_scale=64.0):
-            self._enabled = False
-        def scale(self, loss):
-            return loss
-        def unscale_(self, optimizer):
-            pass
-        def step(self, optimizer):
-            optimizer.step()
-        def update(self):
-            pass
-        def state_dict(self):
-            return {}
-        def load_state_dict(self, state_dict):
-            pass
-        def is_enabled(self):
-            return False
-        def get_scale(self):
-            return 1.0
+    from torch.cuda.amp import GradScaler
+    GRAD_SCALER_HAS_DEVICE_ARG = False
 
 
 def train(args):
 
     seed_everything(args.seed)
-    if args.train_max_disp <= 0 or args.eval_max_disp <= 0:
-        raise ValueError(f"train_max_disp and eval_max_disp must be positive, got {args.train_max_disp} and {args.eval_max_disp}")
-    if args.d0_loss_weight < 0 or args.gate_loss_weight < 0:
-        raise ValueError(f"d0_loss_weight and gate_loss_weight must be non-negative, got {args.d0_loss_weight} and {args.gate_loss_weight}")
-    if args.init_target_temperature <= 0 or args.gate_target_temperature <= 0 or args.max_delta_disp <= 0 or args.amp_init_scale <= 0:
-        raise ValueError(f"temperatures, max_delta_disp, and amp_init_scale must be positive, got {args.init_target_temperature}, {args.gate_target_temperature}, {args.max_delta_disp}, and {args.amp_init_scale}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # if args.train_max_disp <= 0 or args.eval_max_disp <= 0:
+    #     raise ValueError(f"train_max_disp and eval_max_disp must be positive, got {args.train_max_disp} and {args.eval_max_disp}")
+    # if args.d0_loss_weight < 0 or args.gate_loss_weight < 0:
+    #     raise ValueError(f"d0_loss_weight and gate_loss_weight must be non-negative, got {args.d0_loss_weight} and {args.gate_loss_weight}")
+    # if args.init_target_temperature <= 0 or args.gate_target_temperature <= 0 or args.max_delta_disp <= 0 or args.amp_init_scale <= 0:
+    #     raise ValueError(f"temperatures, max_delta_disp, and amp_init_scale must be positive, got {args.init_target_temperature}, {args.gate_target_temperature}, {args.max_delta_disp}, and {args.amp_init_scale}")
+    # if args.gru_edge_lambda < 0 or args.gru_grad_lambda < 0:
+    #     raise ValueError(
+    #         f"gru_edge_lambda and gru_grad_lambda must be non-negative, got "
+    #         f"{args.gru_edge_lambda} and {args.gru_grad_lambda}"
+    #     )
+    # if not 0.0 <= args.edge_topk <= 1.0:
+    #     raise ValueError(f"edge_topk must be in [0, 1], got {args.edge_topk}")
+    # if args.edge_threshold < 0 or args.edge_dilation < 1:
+    #     raise ValueError(f"edge_threshold must be non-negative and edge_dilation positive, got {args.edge_threshold} and {args.edge_dilation}")
 
-    if args.launcher == 'none':
-        args.distributed = False
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        args.distributed = True
+    # if args.launcher == 'none':
+    #     args.distributed = False
+    #     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # else:
+    #     args.distributed = True
 
-        # adjust batch size for each gpu
-        assert args.batch_size % torch.cuda.device_count() == 0
-        args.batch_size = args.batch_size // torch.cuda.device_count()
+    #     # adjust batch size for each gpu
+    #     assert args.batch_size % torch.cuda.device_count() == 0
+    #     args.batch_size = args.batch_size // torch.cuda.device_count()
 
-        dist_params = dict(backend='nccl')
-        init_dist(args.launcher, **dist_params)
-        # re-set gpu_ids with distributed training mode
-        _, world_size = get_dist_info()
-        args.gpu_ids = range(world_size)
-        device = torch.device('cuda:{}'.format(args.local_rank))
+    #     dist_params = dict(backend='nccl')
+    #     init_dist(args.launcher, **dist_params)
+    #     # re-set gpu_ids with distributed training mode
+    #     _, world_size = get_dist_info()
+    #     args.gpu_ids = range(world_size)
+    #     device = torch.device('cuda:{}'.format(args.local_rank))
 
-        setup_for_distributed(args.local_rank == 0)
+    #     setup_for_distributed(args.local_rank == 0)
 
-    model_class = CorGABinsStereo if args.model_arch == 'cor_ga_bins' else CorGAStereo
+    model_classes = {
+        'cor_ga': CorGAStereo,
+        'cor_ga_bins': CorGABinsStereo,
+        'cor_ga_bins2': CorGABinsNoRoPEStereo,
+        'cor_ga_bins3': CorGABinsSmoothInitEdgeStereo,
+        'cor_ga_bins4': CorGABinsAttentionStereo,
+    }
+    model_class = model_classes[args.model_arch]
     model = model_class(args).to(device)
     print("Parameter Count: %d, Trainable: %d" % count_parameters(model))
 
@@ -103,12 +106,17 @@ def train(args):
     start_epoch = 0
     start_step = 0
     optimizer, scheduler = fetch_optimizer(args, model)
-    scaler = GradScaler('cuda', enabled=args.mixed_precision and device.type == 'cuda', init_scale=args.amp_init_scale)
+    if args.mixed_precision and args.amp_dtype == 'bf16' and device.type == 'cuda' and not torch.cuda.is_bf16_supported():
+        raise RuntimeError('BF16 mixed precision is not supported by this CUDA device')
+    scaler_enabled = args.mixed_precision and args.amp_dtype == 'fp16' and device.type == 'cuda'
+    scaler = (GradScaler('cuda', enabled=scaler_enabled, init_scale=args.amp_init_scale)
+              if GRAD_SCALER_HAS_DEVICE_ARG
+              else GradScaler(enabled=scaler_enabled, init_scale=args.amp_init_scale))
 
     if args.resume_ckpt:
         assert args.resume_ckpt.endswith(".pth")
         logging.info("Loading checkpoint: %s" % args.resume_ckpt)
-        checkpoint = torch.load(args.resume_ckpt, map_location='cpu', weights_only=True, mmap=True)
+        checkpoint = torch.load(args.resume_ckpt, map_location='cpu', weights_only=False, mmap=True)
         if 'model' in checkpoint:
             load_result = model_without_ddp.load_state_dict(checkpoint['model'], strict=args.strict_resume)
         else:
@@ -133,10 +141,10 @@ def train(args):
                     param_group['lr'] = restored_lr
             else:
                 logging.warning("Checkpoint has no scheduler state; reconstructing it from step %d", start_step)
-            if scaler.is_enabled() and 'scaler' in checkpoint:
+            if scaler.is_enabled() and checkpoint.get('scaler'):
                 scaler.load_state_dict(checkpoint['scaler'])
             elif scaler.is_enabled():
-                logging.warning("Checkpoint has no GradScaler state; starting with a fresh AMP scale")
+                logging.warning("Checkpoint has no usable GradScaler state; starting with a fresh AMP scale")
         elif not args.no_resume_optimizer:
             logging.warning("Checkpoint has no complete optimizer/step/epoch state; loading model weights only")
         del checkpoint
@@ -181,22 +189,47 @@ def train(args):
             disp_gt = data_blob["disp"].cuda()
             valid = data_blob["valid"].cuda()
 
-            assert model.training
-            disp_predictions, aux = model(image1, image2, iters=args.train_iters, scale_iters=args.scale_iters, return_aux=True)
-            assert model.training
-
+            disp_predictions, aux = [], {}
             try:
+                assert model.training
+                disp_predictions, aux = model(image1, image2, iters=args.train_iters, scale_iters=args.scale_iters, return_aux=True)
+                assert model.training
                 if 'init_disps' in aux:
                     init_bins = model_without_ddp.bin_initializer.bin_disparities
-                    main_loss, metrics = sequence_loss_multi_init_waft(aux['init_disps'], aux['init_logits'], aux['w_h_logits'], disp_predictions, disp_gt, valid, init_bins, aux['init_valid'], loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta, downsample=2 ** args.n_downsample, init_target_temperature=args.init_target_temperature, gate_loss_weight=args.gate_loss_weight, gate_target_temperature=args.gate_target_temperature, d0_loss_weight=args.d0_loss_weight)
+                    main_loss, metrics = (sequence_loss_multi_init_smooth_l1_edge if args.model_arch == 'cor_ga_bins3' else sequence_loss_multi_init_waft)(
+                        aux['init_disps'],
+                        aux['init_logits'],
+                        aux['w_h_logits'],
+                        disp_predictions,
+                        disp_gt,
+                        valid,
+                        init_bins,
+                        aux['init_valid'],
+                        loss_gamma=args.loss_gamma,
+                        max_flow=args.train_max_disp,
+                        smooth_l1_beta=args.smooth_l1_beta,
+                        downsample=2 ** args.n_downsample,
+                        init_target_temperature=args.init_target_temperature,
+                        gate_loss_weight=args.gate_loss_weight,
+                        gate_target_temperature=args.gate_target_temperature,
+                        d0_loss_weight=args.d0_loss_weight,
+                        use_gru_edge_loss=args.use_gru_edge_loss,
+                        edge_mode=args.edge_mode,
+                        edge_topk=args.edge_topk,
+                        edge_threshold=args.edge_threshold,
+                        edge_dilation=args.edge_dilation,
+                        gru_edge_lambda=args.gru_edge_lambda,
+                        use_gru_disp_grad_loss=args.use_gru_disp_grad_loss,
+                        gru_grad_lambda=args.gru_grad_lambda,
+                    )
                     coarse_loss = main_loss.new_tensor(0.0)
                     loss = main_loss
                 else:
-                    main_loss, metrics = sequence_loss_d0L1_edge(disp_predictions, disp_gt, valid, max_flow=args.train_max_disp)
-                    coarse_losses = [sequence_loss_d0L1_edge(branch_predictions, disp_gt, valid, max_flow=args.train_max_disp)[0] for branch_predictions in aux.get('coarse_predictions', [])]
+                    main_loss, metrics = sequence_loss_d0L1(disp_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta)
+                    coarse_losses = [sequence_loss_d0L1(branch_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta)[0] for branch_predictions in aux.get('coarse_predictions', [])]
                     coarse_loss = torch.stack(coarse_losses).mean() if coarse_losses else main_loss.new_tensor(0.0)
                     loss = main_loss + args.coarse_loss_weight * coarse_loss
-            except AssertionError:
+            except (AssertionError, FloatingPointError) as error:
                 if args.local_rank == 0 and args.debug_nan:
                     nonfinite_outputs = []
                     for prediction_index, prediction in enumerate(disp_predictions):
@@ -221,7 +254,7 @@ def train(args):
                     failure_model_path = Path('checkpoints/%s/nan_model_snapshot_step_%d.pth' % (args.name, total_steps))
                     torch.save({'step': total_steps, 'image1': image1.detach().cpu(), 'image2': image2.detach().cpu(), 'disp_gt': disp_gt.detach().cpu(), 'valid': valid.detach().cpu()}, failure_batch_path)
                     torch.save({'step': total_steps, 'model': model_without_ddp.state_dict()}, failure_model_path)
-                    logging.exception("Loss detected NaN/Inf in %s; batch saved to %s and model saved to %s", ', '.join(nonfinite_outputs) or 'unknown output', failure_batch_path.absolute(), failure_model_path.absolute())
+                    logging.exception("Non-finite failure (%s) in %s; batch saved to %s and model saved to %s", error, ', '.join(nonfinite_outputs) or 'stage reported by exception', failure_batch_path.absolute(), failure_model_path.absolute())
                 raise
             metrics['main_loss'] = main_loss.detach().item()
             metrics['coarse_loss'] = coarse_loss.detach().item()
@@ -246,7 +279,37 @@ def train(args):
                     reported_grad_stride_mismatch = True
 
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not torch.isfinite(grad_norm):
+                if scaler.is_enabled():
+                    scale_before = scaler.get_scale()
+                    # unscale_() has already recorded the non-finite gradients.
+                    # GradScaler.step() therefore skips optimizer.step(), while
+                    # update() lowers the scale so the next batch can recover.
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scale_after = scaler.get_scale()
+                    amp_overflow_count += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    if args.local_rank == 0 and (amp_overflow_count == 1 or amp_overflow_count % 10 == 0):
+                        logging.warning(
+                            "AMP gradient overflow #%d at optimizer step %d "
+                            "(grad_norm=%s, scale %.1f -> %.1f); update skipped and scheduler held",
+                            amp_overflow_count,
+                            total_steps,
+                            grad_norm.detach().item(),
+                            scale_before,
+                            scale_after,
+                        )
+                    continue
+
+                if args.local_rank == 0:
+                    failure_batch_path = Path('checkpoints/%s/nonfinite_gradient_batch_step_%d.pth' % (args.name, total_steps))
+                    failure_model_path = Path('checkpoints/%s/nonfinite_gradient_model_step_%d.pth' % (args.name, total_steps))
+                    torch.save({'step': total_steps, 'grad_norm': grad_norm.detach().cpu(), 'image1': image1.detach().cpu(), 'image2': image2.detach().cpu(), 'disp_gt': disp_gt.detach().cpu(), 'valid': valid.detach().cpu()}, failure_batch_path)
+                    torch.save({'step': total_steps, 'model': model_without_ddp.state_dict()}, failure_model_path)
+                    logging.error("Non-finite gradient norm %s at optimizer step %d; stopping before optimizer update. Batch saved to %s and model saved to %s", grad_norm.detach().item(), total_steps, failure_batch_path.absolute(), failure_model_path.absolute())
+                raise FloatingPointError(f"Non-finite gradient norm at optimizer step {total_steps}: {grad_norm.detach().item()}")
 
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
@@ -319,7 +382,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='defom-stereo', help="name your experiment")
-    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga', 'cor_ga_bins'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins4'], help='model architecture')
 
     # resume pretrained model or resume training
     parser.add_argument('--resume_ckpt', default=None, type=str,
@@ -340,6 +403,7 @@ if __name__ == '__main__':
     parser.add_argument('--coarse_loss_weight', type=float, default=0.2, help="weight of coarse cor_ga losses; ignored by cor_ga_bins")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+    parser.add_argument('--amp_dtype', choices=['fp16', 'bf16'], default='fp16', help='autocast dtype used with --mixed_precision')
     parser.add_argument('--amp_init_scale', type=float, default=64.0, help='initial FP16 GradScaler scale; ignored without mixed precision and restored from full checkpoints')
     parser.add_argument('--debug_nan', action='store_true', help='enable targeted non-finite checks for NaN reproduction')
     parser.add_argument('--seed', default=1234565, type=int)
@@ -368,12 +432,25 @@ if __name__ == '__main__':
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='exclusive upper bound of bin offsets in each compressed right-feature coordinate')
     parser.add_argument('--init_corr_scale', type=float, default=10.0, help='scale applied to cosine matching logits')
+    parser.add_argument('--init_right_compression', choices=['avg', 'conv'], default='avg',
+                        help='right-feature width compression used by cor_ga_bins bin matching')
+    parser.add_argument('--refine_right_compression', choices=['avg', 'conv'], default='avg',
+                        help='right-feature width compression used by cor_ga_bins GRU warp lookup')
     parser.add_argument('--loss_gamma', type=float, default=0.9, help='decay factor for successive recurrent L1 losses')
     parser.add_argument('--init_target_temperature', type=float, default=1.0, help='WAFT target temperature in full-resolution disparity pixels')
     parser.add_argument('--gate_loss_weight', type=float, default=0.1, help='weight of direct hypothesis-gate soft cross-entropy')
     parser.add_argument('--gate_target_temperature', type=float, default=4.0, help='hypothesis-gate target temperature in full-resolution disparity pixels')
     parser.add_argument('--smooth_l1_beta', type=float, default=1.0, help='SmoothL1 beta for fused d0 in full-resolution disparity pixels')
     parser.add_argument('--d0_loss_weight', type=float, default=1.0, help='weight of the directly supervised fused d0 SmoothL1 loss')
+    parser.add_argument('--use_gru_edge_loss', action='store_true', help='apply GT-disparity edge weighting only to recurrent GRU predictions')
+    parser.add_argument('--edge_mode', choices=['topk', 'threshold'], default='topk', help='method used to select GT disparity edges')
+    parser.add_argument('--edge_topk', type=float, default=0.10, help='per-image fraction of strongest valid GT gradients selected in topk mode')
+    parser.add_argument('--init_branch_loss_weight', type=float, default=0.1, help='bins3 weight for summed per-branch initial-disparity SmoothL1 losses')
+    parser.add_argument('--edge_threshold', type=float, default=1.0, help='GT disparity-gradient threshold in pixels for threshold mode')
+    parser.add_argument('--edge_dilation', type=int, default=5, help='edge-mask dilation kernel size in full-resolution pixels')
+    parser.add_argument('--gru_edge_lambda', type=float, default=1.0, help='extra recurrent L1 weight assigned to selected edge pixels')
+    parser.add_argument('--use_gru_disp_grad_loss', action='store_true', help='add final-GRU disparity-gradient consistency loss')
+    parser.add_argument('--gru_grad_lambda', type=float, default=0.02, help='weight of the optional final-GRU disparity-gradient loss')
     parser.add_argument('--max_delta_disp', type=float, default=8.0, help='smooth per-iteration disparity-update limit in quarter-resolution pixels')
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
     parser.add_argument('--corr_levels', type=int, default=2, help="number of levels in the shared right-coordinate FullCorr pyramid")

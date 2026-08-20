@@ -85,24 +85,29 @@ class StructureEncoder(nn.Module):
 class MotionEncoder(nn.Module):
     def __init__(self, hidden_dim, corplane, warp_feat_dim):
         super(MotionEncoder, self).__init__()
-        cor_plane = corplane
-        self.convc1 = nn.Conv2d(cor_plane, hidden_dim // 2, 1, padding=0)
-        self.convc2 = nn.Conv2d(hidden_dim // 2, hidden_dim // 2, 3, padding=1)
+        self.use_corr = corplane > 0
+        if self.use_corr:
+            self.convc1 = nn.Conv2d(corplane, hidden_dim // 2, 1, padding=0)
+            self.convc2 = nn.Conv2d(hidden_dim // 2, hidden_dim // 2, 3, padding=1)
         self.convd1 = nn.Conv2d(1, hidden_dim // 2, 7, padding=3)
         self.convd2 = nn.Conv2d(hidden_dim // 2, hidden_dim // 2, 3, padding=1)
         self.convg1 = nn.Conv2d(warp_feat_dim, hidden_dim // 2, 1, padding=0)
         self.convg2 = nn.Conv2d(hidden_dim // 2, hidden_dim // 2, 3, padding=1)
-        self.conv = nn.Conv2d(hidden_dim*3//2, hidden_dim - 1, 3, padding=1)
-    
+        motion_channels = hidden_dim + (hidden_dim // 2 if self.use_corr else 0)
+        self.conv = nn.Conv2d(motion_channels, hidden_dim - 1, 3, padding=1)
+
     def forward(self, corr, disp, warp_feat):
-        cor = F.relu(self.convc1(corr), True)
-        cor = F.relu(self.convc2(cor), True)
+        motion_features = []
+        if self.use_corr:
+            cor = F.relu(self.convc1(corr), True)
+            cor = F.relu(self.convc2(cor), True)
+            motion_features.append(cor)
         dis = F.relu(self.convd1(disp), True)
         dis = F.relu(self.convd2(dis), True)
         war = F.relu(self.convg1(warp_feat), True)
         war = F.relu(self.convg2(war), True)
-        out = torch.cat([cor, dis, war], dim=1)
-        out = F.relu(self.conv(out), True)
+        motion_features.extend([dis, war])
+        out = F.relu(self.conv(torch.cat(motion_features, dim=1)), True)
 
         return torch.cat([out, disp], dim=1)
 

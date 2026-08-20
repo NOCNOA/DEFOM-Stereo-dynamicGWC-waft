@@ -108,15 +108,53 @@
 # 2>&1 | tee -a ${CHECKPOINT_DIR}/train.log
 
 
+# Legacy edge-loss experiment, disabled to prevent loading its old checkpoint.
+# if false; then
+# export CUDA_VISIBLE_DEVICES=0
+# CHECKPOINT_DIR=checkpoints/defomstereo_vitl_twostage_768 && \
+# mkdir -p ${CHECKPOINT_DIR} && \
+# python train_stereo.py \
+# --launcher none \
+# --gpu_ids 0    \
+# --name defomstereo_vitl_twostage_768 \
+# --batch_size 2  \
+# --num_workers 2  \
+# --train_datasets sceneflow \
+# --train_folds 1 \
+# --num_steps 200000 \
+# --save_ckpt_freq 20000 \
+# --save_latest_ckpt_freq 1000 \
+# --n_downsample 2 \
+# --train_iters 18 \
+# --scale_iters 6 \
+# --hypothesis_scales 24 48 96 \
+# --coarse_loss_weight 0.2 \
+# --train_max_disp 768 \
+# --eval_max_disp 768 \
+# --corr_levels 3 \
+# --resume_ckpt ${CHECKPOINT_DIR}/checkpoint_latest.pth \
+# --mixed_precision \
+# --debug_nan \
+# --corr_radius 4 \
+# --dinov2_encoder vitl \
+# --lr 0.00020 \
+# 2>&1 | tee -a ${CHECKPOINT_DIR}/train.log
+# fi
+
+
+# Single-GPU ViT-L cor_ga BF16 experiment with ordinary sequence losses.
+# Fresh run: BF16 keeps FP16-like memory while avoiding FP16 exponent overflow.
 export CUDA_VISIBLE_DEVICES=0
-CHECKPOINT_DIR=checkpoints/defomstereo_vitl_twostage_768 && \
-mkdir -p ${CHECKPOINT_DIR} && \
-python train_stereo.py \
+CHECKPOINT_DIR=checkpoints/defomstereo_vitl_corga_normal_loss_bf16
+mkdir -p "${CHECKPOINT_DIR}"
+
+/home/u2025140689/anaconda3/envs/defomstereo2/bin/python train_stereo.py \
+--model_arch cor_ga \
 --launcher none \
---gpu_ids 0    \
---name defomstereo_vitl_twostage_768 \
---batch_size 2  \
---num_workers 2  \
+--gpu_ids 0 \
+--name defomstereo_vitl_corga_normal_loss_bf16 \
+--batch_size 2 \
+--num_workers 2 \
 --train_datasets sceneflow \
 --train_folds 1 \
 --num_steps 200000 \
@@ -127,13 +165,14 @@ python train_stereo.py \
 --scale_iters 6 \
 --hypothesis_scales 24 48 96 \
 --coarse_loss_weight 0.2 \
+--loss_gamma 0.9 \
+--smooth_l1_beta 1.0 \
 --train_max_disp 768 \
 --eval_max_disp 768 \
 --corr_levels 3 \
---resume_ckpt ${CHECKPOINT_DIR}/checkpoint_latest.pth \
---mixed_precision \
---debug_nan \
 --corr_radius 4 \
 --dinov2_encoder vitl \
+--mixed_precision \
+--amp_dtype bf16 \
+--debug_nan \
 --lr 0.00020 \
-2>&1 | tee -a ${CHECKPOINT_DIR}/train.log

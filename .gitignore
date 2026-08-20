@@ -18,6 +18,7 @@ Thumbs.db
 *.out
 nohup.out
 nohup*.out
+nohups/
 
 # Model weights / checkpoints
 checkpoints/
@@ -41,3 +42,7 @@ logs/
 # Temporary visualization / generated artifacts
 *.tmp
 *.temp
+
+#data analys
+diagnostics/
+data_ana/

@@ -25,14 +25,22 @@ except Exception:
 
 class DEFOMStereo(nn.Module):
     """
-    1\视差初始是从单目估计-乘以多个固定倍率-多个送到GRU-聚合，注意这里的update的corr特征只有full correlation
-    2\降维、压缩右侧特征
+    1、视差初始是从单目估计-乘以多个固定倍率-多个送到GRU-聚合，注意这里的update的corr特征只有full correlation
+    2、降维、压缩右侧特征
+
+    模型改动：
+    1. 混合精度计算支持 FP16/BF16 选择，BF16 用于扩大动态范围并避免 FP16 overflow。
+    2. FullCorr 相关体始终使用 FP32 构造。
+    3. context、coarse GRU、融合和 refine GRU 使用统一的混合精度类型。
+    4. 视差累加、范围裁剪与相关坐标保持 FP32。
     """
 
     def __init__(self, args, build_coarse_gru=True, right_width_compression_mode="conv"):
         super(DEFOMStereo, self).__init__()
         self.args = args
         self.register_buffer('mean', torch.tensor([[0.485, 0.456, 0.406]])[..., None, None] * 255)
+        amp_dtype_name = getattr(args, 'amp_dtype', 'fp16')
+        self.amp_dtype = torch.bfloat16 if amp_dtype_name == 'bf16' else torch.float16
         self.register_buffer('std', torch.tensor([[0.229, 0.224, 0.225]])[..., None, None] * 255)
 
         self.defomencoder = DefomEncoder(args.dinov2_encoder)
@@ -100,7 +108,11 @@ class DEFOMStereo(nn.Module):
     def _bound_disparity(self, disp):
         max_disp = float(getattr(self.args, 'train_max_disp', 768.0)) / (2 ** self.args.n_downsample)
         return disp.float().clamp(min=0.0, max=max_disp)
-
+    def _bound_delta_disparity(self, delta_disp):
+        """平滑限制每次 GRU 的视差更新，同时保留小增量。"""
+        max_delta = float(self.args.max_delta_disp)
+        delta_disp = delta_disp.float()
+        return max_delta * torch.tanh(delta_disp / max_delta)
     def _build_full_corr(self, fmap1, fmap2):
         batch, _, height, width = fmap1.shape
         coords = coords_grid(batch, height, width)[:, :1].to(fmap1.device)
@@ -121,16 +133,18 @@ class DEFOMStereo(nn.Module):
         danv2_io_sizes = get_danv2_io_size(image_height, image_width, self.args.n_downsample)
         dfeat1_4, dfeat2_4, mono_idepth1_4 = self.defomencoder(image1, image2, danv2_io_sizes)
         fmap1_4, fmap2_4 = self.fnet([image1, image2], [dfeat1_4, dfeat2_4])
-        with autocast(enabled=self.args.mixed_precision):
-            context_pyramid = self.cnet(image1, dfeat1_4, num_layers=self.args.n_gru_layers)
+        # Use one explicit AMP dtype throughout the recurrent path. BF16 keeps
+        # half-precision memory while providing a much larger exponent range.
+        with autocast(enabled=self.args.mixed_precision, dtype=self.amp_dtype):
+            context_pyramid = self.cnet(image1.float(), dfeat1_4.float(), num_layers=self.args.n_gru_layers)
             net_4, inp_4 = torch.chunk(context_pyramid[0], chunks=2, dim=1)
             initial_nets = [torch.tanh(net_4)]
             initial_nets.extend(torch.tanh(context) for context in context_pyramid[1:])
             inp_4 = torch.relu(inp_4)
+        with autocast(enabled=self.args.mixed_precision, dtype=self.amp_dtype):
             fmap1_low = self.low_channel(fmap1_4)
             fmap2_low = self.low_channel(fmap2_4)
             fmap2_half, fmap2_quarter = self.right_width_compressor(fmap2_low)
-
         with autocast(enabled=False):
             full_corr = self._build_full_corr(fmap1_4, fmap2_4)
 
@@ -154,21 +168,30 @@ class DEFOMStereo(nn.Module):
             for coarse_iteration in range(scale_iters):
                 disp = disp.detach()
                 corr = full_corr(disp)
-                with autocast(enabled=self.args.mixed_precision):
+                with autocast(enabled=self.args.mixed_precision, dtype=self.amp_dtype):
                     warp_feature = self._coarse_warp_feature(fmap1_low, fmap2_quarter, disp)
-                    net, delta_disp, up_mask = update_block(net, corr, disp, inp_4, warp_feature, mono_prompt)
-                disp = self._bound_disparity(disp + delta_disp.float())
+                    net, delta_disp, up_mask = update_block(
+                        [state.float() for state in net], corr.float(), disp.float(),
+                        inp_4.float(), warp_feature.float(), mono_prompt.float())
+                delta_disp = self._bound_delta_disparity(delta_disp)
+                disp = self._bound_disparity(disp + delta_disp)
                 prediction = self._upsample_prediction(disp, up_mask)
                 coarse_predictions[branch_index].append(prediction)
             coarse_disps[branch_index] = disp
             coarse_nets[branch_index] = net
 
-        with autocast(enabled=self.args.mixed_precision):
-            aggregation_input = torch.cat([coarse_nets[index][0] for index in range(3)] + coarse_disps, dim=1)
+        with autocast(enabled=self.args.mixed_precision, dtype=self.amp_dtype):
+            aggregation_input = torch.cat(
+                [coarse_nets[index][0].float() for index in range(3)]
+                + [coarse_disp.float() for coarse_disp in coarse_disps], dim=1)
             weight_logits = self.hypothesis_weight_head(aggregation_input)
             hypothesis_weights = torch.softmax(weight_logits[:, :3], dim=1)
             scale_weights = torch.softmax(weight_logits[:, 3:], dim=1)
-            refine_nets = [projection(torch.cat([coarse_nets[index][level] for index in range(3)], dim=1)) for level, projection in enumerate(self.refine_state_projections)]
+            refine_nets = [
+                projection(torch.cat(
+                    [coarse_nets[index][level].float() for index in range(3)], dim=1))
+                for level, projection in enumerate(self.refine_state_projections)
+            ]
 
         disp = sum(hypothesis_weights[:, index:index + 1].float() * coarse_disps[index].float() for index in range(3))
         disp = self._bound_disparity(disp)
@@ -180,10 +203,14 @@ class DEFOMStereo(nn.Module):
         for iteration in range(iters):
             disp = disp.detach()
             corr = full_corr(disp)
-            with autocast(enabled=self.args.mixed_precision):
+            with autocast(enabled=self.args.mixed_precision, dtype=self.amp_dtype):
                 warp_feature = self._refine_warp_feature(fmap1_low, right_feature_pyramid, disp, scale_weights)
-                refine_nets, delta_disp, up_mask = self.refine_update_block(refine_nets, corr, disp, inp_4, warp_feature, d0)
-            disp = self._bound_disparity(disp + delta_disp.float())
+            with autocast(enabled=self.args.mixed_precision, dtype=self.amp_dtype):
+                refine_nets, delta_disp, up_mask = self.refine_update_block(
+                    [state.float() for state in refine_nets], corr.float(), disp.float(),
+                    inp_4.float(), warp_feature.float(), d0.float())
+            delta_disp = self._bound_delta_disparity(delta_disp)
+            disp = self._bound_disparity(disp + delta_disp)
 
             if test_mode and iteration < iters - 1:
                 continue

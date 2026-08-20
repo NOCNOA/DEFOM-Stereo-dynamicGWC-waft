@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from core.defom_cor_ga import DEFOMStereo as CorGAStereo, autocast
 from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
+from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
+from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
 
 import core.stereo_datasets as datasets
 from core.utils.utils import InputPadder
@@ -473,7 +475,7 @@ if __name__ == '__main__':
     parser.add_argument('--scale_iters', type=int, default=20, help="number of coarse aggregation updates for each disparity hypothesis.")
 
     # Architecure choices
-    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga', 'cor_ga_bins'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins4'], help='model architecture')
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='maximum bin offset in each compressed right-feature coordinate')
     parser.add_argument('--init_corr_scale', type=float, default=10.0, help='scale applied to cosine matching logits')
@@ -493,7 +495,13 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    model_class = CorGABinsStereo if args.model_arch == 'cor_ga_bins' else CorGAStereo
+    model_classes = {
+        'cor_ga': CorGAStereo,
+        'cor_ga_bins': CorGABinsStereo,
+        'cor_ga_bins2': CorGABinsNoRoPEStereo,
+        'cor_ga_bins4': CorGABinsAttentionStereo,
+    }
+    model_class = model_classes[args.model_arch]
     model = model_class(args)
 
     logging.basicConfig(level=logging.INFO,

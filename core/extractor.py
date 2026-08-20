@@ -534,3 +534,6 @@ class DefomEncoder(nn.Module):
                 raise RuntimeError(f"{name} must be 1/4 resolution {expected_size}, got {tensor.shape[-2:]}")
 
         return left_feat, right_feat, mono_idepth1_4.contiguous()
+
+
+

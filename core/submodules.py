@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Tuple
+from torch.utils.checkpoint import checkpoint
 
 from core.warp import sample_right_feature_pyramid
 
@@ -1271,3 +1272,586 @@ def lookup_right_features(fmap1_low, right_feature_pyramid, disp, warp_offsets, 
         fused_feature = rope_galerkin(fused_feature)
 
     return fused_feature
+
+class lookup_right_features2(nn.Module):
+    """Build and enhance per-scale matching-hypothesis sequences.
+
+    Each pixel and pyramid scale forms an independent sequence over the K
+    sampled disparity hypotheses. A match token consists of group-wise
+    correlation, the channel-wise left-minus-right difference, and the
+    scale-aware physical sampling offset.
+    """
+
+    def __init__(self, compression_ratios=(1, 2, 4), group=8,
+                 channels=32, samples_per_scale=9, projected_token=32,
+                 SA_iters=1, num_heads=4, attention_chunk_size=8192,
+                 checkpoint_scales=True):
+        super().__init__()
+        projected_token_dim = projected_token
+        if num_heads <= 0 or projected_token_dim % num_heads != 0:
+            raise ValueError(
+                f"projected token dimension ({projected_token_dim}) must be "
+                f"divisible by num_heads ({num_heads})"
+            )
+
+        self.compression_ratios = tuple(compression_ratios)
+        self.group = group
+        self.SA_iters = SA_iters
+        self.channels = channels
+        self.samples_per_scale = samples_per_scale
+        self.attention_chunk_size = attention_chunk_size
+        self.checkpoint_scales = checkpoint_scales
+        self.token_dim = projected_token_dim
+        self.token_projection = nn.Sequential(
+            nn.Linear(channels + group + 1, projected_token_dim),
+            nn.GELU(),
+        )
+        self.attn_norms = nn.ModuleList([
+            nn.LayerNorm(projected_token_dim)
+            for _ in range(SA_iters)
+        ])
+        self.self_attn = nn.ModuleList([
+            FlashMultiheadAttention(projected_token_dim, num_heads)
+            for _ in range(SA_iters)
+        ])
+        self.match_mlp = nn.Sequential(
+            nn.Linear(samples_per_scale * projected_token_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+        )
+        self.scale_fuse = nn.Conv2d(
+            len(self.compression_ratios) * 128, 128, kernel_size=1
+        )
+
+    def _forward_single_scale(self, fmap1_low, right_feature, disp,
+                              warp_offsets, compression_ratio,
+                              offset_normalizer):
+        """Sample and encode one scale without materializing other scales."""
+        batch, channels, height, width = fmap1_low.shape
+        sampled_right = sample_right_feature_pyramid(
+            (right_feature,),
+            disp,
+            offsets=warp_offsets.flatten(),
+            compression_ratios=(compression_ratio,),
+            padding_mode='zeros',
+            align_corners=True,
+        )
+        samples_per_scale = sampled_right.shape[1]
+
+        # Keep the left feature broadcastable instead of materializing an
+        # expanded [B,K,C,H,W] copy before computing the match statistics.
+        left_feature = fmap1_low[:, None]
+        feature_difference = left_feature - sampled_right
+
+        channels_per_group = channels // self.group
+        left_grouped = fmap1_low.reshape(
+            batch, self.group, channels_per_group, height, width
+        )[:, None]
+        right_grouped = sampled_right.reshape(
+            batch, samples_per_scale, self.group,
+            channels_per_group, height, width
+        )
+        groupwise_corr = (
+            left_grouped.float() * right_grouped.float()
+        ).mean(dim=3).to(sampled_right.dtype)
+
+        # An offset in a compressed branch corresponds to ratio*offset in the
+        # original feature coordinate. The normalizer is shared by all scales
+        # so the scalar still identifies their different search granularity.
+        offsets = warp_offsets.flatten().to(
+            device=sampled_right.device, dtype=sampled_right.dtype
+        )
+        physical_offsets = offsets * float(compression_ratio)
+        physical_offsets = physical_offsets / offset_normalizer.to(
+            device=sampled_right.device, dtype=sampled_right.dtype
+        )
+        offset_feature = physical_offsets[None, :, None, None, None].expand(
+            batch, samples_per_scale, 1, height, width
+        )
+
+        # [B,K,G+C+1,H,W] -> [B*H*W,K,G+C+1] -> [B*H*W,K,32].
+        match_tokens = torch.cat(
+            [groupwise_corr, feature_difference, offset_feature], dim=2
+        )
+        match_tokens = match_tokens.permute(0, 3, 4, 1, 2).reshape(
+            -1, samples_per_scale, channels + self.group + 1
+        )
+        match_tokens = self.token_projection(match_tokens)
+
+        for norm, self_attn in zip(self.attn_norms, self.self_attn):
+            normalized_tokens = norm(match_tokens)
+            if (normalized_tokens.is_cuda
+                    and normalized_tokens.shape[0] > self.attention_chunk_size):
+                attention_update = torch.cat([
+                    self_attn(token_chunk, token_chunk, token_chunk)
+                    for token_chunk in normalized_tokens.split(
+                        self.attention_chunk_size, dim=0
+                    )
+                ], dim=0)
+            else:
+                attention_update = self_attn(
+                    normalized_tokens, normalized_tokens, normalized_tokens
+                )
+            match_tokens = match_tokens + attention_update
+
+        flattened_tokens = match_tokens.flatten(start_dim=1)
+        scale_features = self.match_mlp(flattened_tokens)
+        return scale_features.reshape(
+            batch, height, width, 128
+        ).permute(0, 3, 1, 2)
+
+    def forward(self, fmap1_low, right_feature_pyramid, disp, warp_offsets,
+                scale_weights):
+        """Return the scale-weighted matching feature ``[B,128,H,W]``."""
+        offsets = warp_offsets.flatten().to(device=disp.device, dtype=disp.dtype)
+        ratios = offsets.new_tensor(self.compression_ratios)
+        offset_normalizer = (
+            ratios[:, None] * offsets[None, :]
+        ).abs().amax().clamp_min(1.0)
+
+        weighted_scale_features = []
+        for scale_idx, (right_feature, ratio) in enumerate(zip(
+                right_feature_pyramid, self.compression_ratios)):
+            if self.checkpoint_scales and self.training and torch.is_grad_enabled():
+                # Bind ratio as a default argument: checkpoint recomputes this
+                # closure during backward after the Python loop has completed.
+                def run_scale(left, right, current_disp, current_offsets,
+                              normalizer, scale_ratio=ratio):
+                    return self._forward_single_scale(
+                        left, right, current_disp, current_offsets,
+                        scale_ratio, normalizer
+                    )
+
+                scale_feature = checkpoint(
+                    run_scale,
+                    fmap1_low,
+                    right_feature,
+                    disp,
+                    warp_offsets,
+                    offset_normalizer,
+                    use_reentrant=False,
+                )
+            else:
+                scale_feature = self._forward_single_scale(
+                    fmap1_low,
+                    right_feature,
+                    disp,
+                    warp_offsets,
+                    ratio,
+                    offset_normalizer,
+                )
+
+            scale_weight = scale_weights[:, scale_idx:scale_idx + 1].to(
+                scale_feature.dtype
+            )
+            weighted_scale_features.append(scale_feature * scale_weight)
+
+        # Preserve scale identity: gate each scale, concatenate scales along
+        # channels, then learn their fusion with a point-wise projection.
+        return self.scale_fuse(torch.cat(weighted_scale_features, dim=1))
+
+
+class _HypothesisMixerBase(nn.Module):
+    """Shared channel-mixing utilities for hypothesis mixers."""
+
+    def __init__(self, channels, expansion=2.0, ffn_type='mlp', dropout=0.0):
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        if expansion <= 0:
+            raise ValueError(f"expansion must be positive, got {expansion}")
+        if ffn_type not in ('mlp', 'gated'):
+            raise ValueError(f"ffn_type must be 'mlp' or 'gated', got {ffn_type!r}")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0,1), got {dropout}")
+
+        self.channels = int(channels)
+        self.ffn_type = ffn_type
+        hidden_channels = max(self.channels, int(round(self.channels * expansion)))
+        self.channel_norm = nn.LayerNorm(self.channels)
+
+        if ffn_type == 'mlp':
+            self.channel_mixer = nn.Sequential(
+                nn.Conv1d(self.channels, hidden_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv1d(hidden_channels, self.channels, kernel_size=1),
+                nn.Dropout(dropout),
+            )
+        else:
+            # The first half carries values and the second half supplies a
+            # SiLU gate. Both operate independently at every hypothesis.
+            self.channel_in = nn.Conv1d(
+                self.channels, 2 * hidden_channels, kernel_size=1
+            )
+            self.channel_out = nn.Conv1d(
+                hidden_channels, self.channels, kernel_size=1
+            )
+            self.channel_dropout = nn.Dropout(dropout)
+
+    def _flatten_tokens(self, x):
+        if x.ndim not in (3, 5):
+            raise ValueError(
+                "hypothesis features must be [N,K,C] or [B,H,W,K,C], "
+                f"got {tuple(x.shape)}"
+            )
+        if x.shape[-1] != self.channels:
+            raise ValueError(
+                f"expected {self.channels} channels, got {x.shape[-1]}"
+            )
+        original_shape = x.shape
+        return x.reshape(-1, x.shape[-2], self.channels), original_shape
+
+    def _mix_channels(self, tokens):
+        # LayerNorm acts on C in [N,K,C]; Conv1d then treats K as its length.
+        channel_input = self.channel_norm(tokens).transpose(1, 2)
+        if self.ffn_type == 'mlp':
+            channel_update = self.channel_mixer(channel_input)
+        else:
+            value, gate = self.channel_in(channel_input).chunk(2, dim=1)
+            channel_update = self.channel_out(value * F.silu(gate))
+            channel_update = self.channel_dropout(channel_update)
+        return tokens + channel_update.transpose(1, 2)
+
+
+class HypothesisMixer(_HypothesisMixerBase):
+    """Mix an ordered disparity-hypothesis sequence with depthwise Conv1D.
+
+    Accepted shapes are ``[N,K,C]`` and ``[B,H,W,K,C]``. The last-but-one
+    dimension is always interpreted as the disparity-hypothesis dimension;
+    image width is never convolved. Input and output shapes are identical.
+    """
+
+    def __init__(self, channels, kernel_size=3, expansion=2.0,
+                 ffn_type='mlp', dropout=0.0):
+        super().__init__(channels, expansion, ffn_type, dropout)
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(
+                f"kernel_size must be a positive odd integer, got {kernel_size}"
+            )
+        self.kernel_size = int(kernel_size)
+        self.hypothesis_norm = nn.LayerNorm(self.channels)
+        self.hypothesis_mixer = nn.Conv1d(
+            self.channels,
+            self.channels,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            groups=self.channels,
+        )
+        self.hypothesis_dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        tokens, original_shape = self._flatten_tokens(x)
+
+        # [N,K,C] -> LN over C -> [N,C,K] -> depthwise convolution over K.
+        hypothesis_input = self.hypothesis_norm(tokens).transpose(1, 2)
+        hypothesis_update = self.hypothesis_mixer(hypothesis_input)
+        hypothesis_update = self.hypothesis_dropout(hypothesis_update)
+        tokens = tokens + hypothesis_update.transpose(1, 2)
+
+        tokens = self._mix_channels(tokens)
+        return tokens.reshape(original_shape)
+
+
+class DynamicHypothesisMixer(_HypothesisMixerBase):
+    """Use a per-pixel local kernel predicted from the left feature.
+
+    ``x`` accepts ``[N,K,C]`` or ``[B,H,W,K,C]``. ``condition`` must be
+    ``[N,C_l]`` or ``[B,H,W,C_l]`` with matching leading dimensions. The
+    implementation loops over the small kernel support and never constructs
+    an ``[N,K,K]`` attention matrix or a large unfolded tensor.
+    """
+
+    def __init__(self, channels, condition_channels=None, kernel_size=3,
+                 expansion=2.0, ffn_type='mlp', dropout=0.0,
+                 predictor_hidden_channels=None):
+        super().__init__(channels, expansion, ffn_type, dropout)
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(
+                f"kernel_size must be a positive odd integer, got {kernel_size}"
+            )
+        self.kernel_size = int(kernel_size)
+        self.condition_channels = int(condition_channels or channels)
+        predictor_hidden_channels = int(
+            predictor_hidden_channels or self.condition_channels
+        )
+        self.hypothesis_norm = nn.LayerNorm(self.channels)
+        self.condition_norm = nn.LayerNorm(self.condition_channels)
+        self.kernel_predictor = nn.Sequential(
+            nn.Linear(self.condition_channels, predictor_hidden_channels),
+            nn.GELU(),
+            nn.Linear(predictor_hidden_channels, self.kernel_size),
+        )
+        self.hypothesis_dropout = nn.Dropout(dropout)
+
+    def forward(self, x, condition):
+        tokens, original_shape = self._flatten_tokens(x)
+        expected_condition_shape = original_shape[:-2] + (self.condition_channels,)
+        if tuple(condition.shape) != tuple(expected_condition_shape):
+            raise ValueError(
+                f"condition must be {tuple(expected_condition_shape)}, "
+                f"got {tuple(condition.shape)}"
+            )
+        condition = condition.reshape(-1, self.condition_channels)
+
+        # One normalized local kernel per pixel/sequence, shared over channels.
+        kernel_weights = torch.softmax(
+            self.kernel_predictor(self.condition_norm(condition)), dim=-1
+        )
+        normalized = self.hypothesis_norm(tokens).transpose(1, 2)
+        hypothesis_count = normalized.shape[-1]
+        padding = self.kernel_size // 2
+        padded = F.pad(normalized, (padding, padding))
+        hypothesis_update = torch.zeros_like(normalized)
+        for kernel_index in range(self.kernel_size):
+            local_values = padded[
+                :, :, kernel_index:kernel_index + hypothesis_count
+            ]
+            hypothesis_update = hypothesis_update + (
+                local_values * kernel_weights[:, kernel_index, None, None]
+            )
+
+        hypothesis_update = self.hypothesis_dropout(hypothesis_update)
+        tokens = tokens + hypothesis_update.transpose(1, 2)
+        tokens = self._mix_channels(tokens)
+        return tokens.reshape(original_shape)
+
+
+class lookup_right_features3(nn.Module):
+    """Build matching tokens and mix them locally along disparity hypotheses.
+
+    Each pyramid scale is sampled and processed independently. By default every
+    scale owns a separate static :class:`HypothesisMixer`, reflecting that one
+    step along K represents a different physical disparity at each scale.
+    The public interface and final output match ``lookup_right_features2``.
+    """
+
+    def __init__(self, compression_ratios=(1, 2, 4), group=8,
+                 channels=32, samples_per_scale=9, projected_token=32,
+                 mixer_iters=1, kernel_size=3, expansion=2.0,
+                 ffn_type='mlp', dropout=0.0, mixer_type='static',
+                 share_mixers=False, use_offset_encoding=False,
+                 offset_embedding_dim=4, checkpoint_scales=True):
+        super().__init__()
+        if channels % group != 0:
+            raise ValueError(
+                f"channels ({channels}) must be divisible by group ({group})"
+            )
+        if samples_per_scale <= 0:
+            raise ValueError(
+                f"samples_per_scale must be positive, got {samples_per_scale}"
+            )
+        if mixer_iters <= 0:
+            raise ValueError(f"mixer_iters must be positive, got {mixer_iters}")
+        if mixer_type not in ('static', 'dynamic'):
+            raise ValueError(
+                f"mixer_type must be 'static' or 'dynamic', got {mixer_type!r}"
+            )
+        if use_offset_encoding and offset_embedding_dim <= 0:
+            raise ValueError(
+                "offset_embedding_dim must be positive when offset encoding "
+                f"is enabled, got {offset_embedding_dim}"
+            )
+
+        self.compression_ratios = tuple(compression_ratios)
+        self.group = int(group)
+        self.channels = int(channels)
+        self.samples_per_scale = int(samples_per_scale)
+        self.projected_token = int(projected_token)
+        self.mixer_type = mixer_type
+        self.share_mixers = bool(share_mixers)
+        self.use_offset_encoding = bool(use_offset_encoding)
+        self.checkpoint_scales = bool(checkpoint_scales)
+
+        raw_token_dim = self.channels + self.group
+        if self.use_offset_encoding:
+            self.offset_encoder = nn.Sequential(
+                nn.Linear(1, offset_embedding_dim),
+                nn.GELU(),
+            )
+            raw_token_dim += offset_embedding_dim
+        else:
+            self.offset_encoder = None
+
+        self.token_projection = nn.Sequential(
+            nn.Linear(raw_token_dim, self.projected_token),
+            nn.GELU(),
+        )
+
+        def make_mixer_stack():
+            blocks = []
+            for _ in range(mixer_iters):
+                common_kwargs = dict(
+                    channels=self.projected_token,
+                    kernel_size=kernel_size,
+                    expansion=expansion,
+                    ffn_type=ffn_type,
+                    dropout=dropout,
+                )
+                if mixer_type == 'static':
+                    block = HypothesisMixer(**common_kwargs)
+                else:
+                    block = DynamicHypothesisMixer(
+                        **common_kwargs,
+                        condition_channels=self.channels,
+                    )
+                blocks.append(block)
+            return nn.ModuleList(blocks)
+
+        mixer_count = 1 if self.share_mixers else len(self.compression_ratios)
+        self.mixers = nn.ModuleList([
+            make_mixer_stack() for _ in range(mixer_count)
+        ])
+        self.match_mlp = nn.Sequential(
+            nn.Linear(
+                self.samples_per_scale * self.projected_token, 128
+            ),
+            nn.GELU(),
+            nn.Linear(128, 128),
+        )
+        self.scale_fuse = nn.Conv2d(
+            len(self.compression_ratios) * 128, 128, kernel_size=1
+        )
+
+    def _forward_single_scale(self, fmap1_low, right_feature, disp,
+                              warp_offsets, compression_ratio, scale_index,
+                              offset_normalizer):
+        batch, channels, height, width = fmap1_low.shape
+        sampled_right = sample_right_feature_pyramid(
+            (right_feature,),
+            disp,
+            offsets=warp_offsets.flatten(),
+            compression_ratios=(compression_ratio,),
+            padding_mode='zeros',
+            align_corners=True,
+        )
+        hypothesis_count = sampled_right.shape[1]
+        if hypothesis_count != self.samples_per_scale:
+            raise ValueError(
+                f"expected {self.samples_per_scale} hypotheses per scale, "
+                f"got {hypothesis_count}"
+            )
+
+        feature_difference = fmap1_low[:, None] - sampled_right
+        channels_per_group = channels // self.group
+        left_grouped = fmap1_low.reshape(
+            batch, self.group, channels_per_group, height, width
+        )[:, None]
+        right_grouped = sampled_right.reshape(
+            batch, hypothesis_count, self.group,
+            channels_per_group, height, width
+        )
+        groupwise_corr = (
+            left_grouped.float() * right_grouped.float()
+        ).mean(dim=3).to(sampled_right.dtype)
+
+        token_parts = [groupwise_corr, feature_difference]
+        if self.use_offset_encoding:
+            offsets = warp_offsets.flatten().to(
+                device=sampled_right.device, dtype=sampled_right.dtype
+            )
+            physical_offsets = offsets * float(compression_ratio)
+            physical_offsets = physical_offsets / offset_normalizer.to(
+                device=sampled_right.device, dtype=sampled_right.dtype
+            )
+            offset_embedding = self.offset_encoder(physical_offsets[:, None])
+            offset_embedding = offset_embedding[None, :, :, None, None].expand(
+                batch, hypothesis_count, offset_embedding.shape[-1],
+                height, width
+            )
+            token_parts.append(offset_embedding)
+
+        # [B,K,G+C(+Cp),H,W] -> [BHW,K,G+C(+Cp)] -> [BHW,K,C_projected].
+        match_tokens = torch.cat(token_parts, dim=2)
+        match_tokens = match_tokens.permute(0, 3, 4, 1, 2).reshape(
+            -1, hypothesis_count, match_tokens.shape[2]
+        )
+        match_tokens = self.token_projection(match_tokens)
+
+        mixer_index = 0 if self.share_mixers else scale_index
+        mixer_stack = self.mixers[mixer_index]
+        if self.mixer_type == 'dynamic':
+            left_condition = fmap1_low.permute(0, 2, 3, 1).reshape(
+                -1, channels
+            )
+            for mixer in mixer_stack:
+                match_tokens = mixer(match_tokens, left_condition)
+        else:
+            for mixer in mixer_stack:
+                match_tokens = mixer(match_tokens)
+
+        scale_features = self.match_mlp(match_tokens.flatten(start_dim=1))
+        return scale_features.reshape(
+            batch, height, width, 128
+        ).permute(0, 3, 1, 2)
+
+    def forward(self, fmap1_low, right_feature_pyramid, disp, warp_offsets,
+                scale_weights):
+        """Return the weighted-concat multi-scale feature ``[B,128,H,W]``."""
+        if fmap1_low.ndim != 4:
+            raise ValueError(
+                f"fmap1_low must be [B,C,H,W], got {tuple(fmap1_low.shape)}"
+            )
+        batch, channels, height, width = fmap1_low.shape
+        if channels != self.channels:
+            raise ValueError(
+                f"expected fmap1_low with {self.channels} channels, got {channels}"
+            )
+        num_scales = len(self.compression_ratios)
+        if len(right_feature_pyramid) != num_scales:
+            raise ValueError(
+                f"expected {num_scales} right feature scales, "
+                f"got {len(right_feature_pyramid)}"
+            )
+        expected_weight_shape = (batch, num_scales, height, width)
+        if tuple(scale_weights.shape) != expected_weight_shape:
+            raise ValueError(
+                f"scale_weights must be {expected_weight_shape}, "
+                f"got {tuple(scale_weights.shape)}"
+            )
+
+        offsets = warp_offsets.flatten().to(device=disp.device, dtype=disp.dtype)
+        ratios = offsets.new_tensor(self.compression_ratios)
+        offset_normalizer = (
+            ratios[:, None] * offsets[None, :]
+        ).abs().amax().clamp_min(1.0)
+
+        weighted_scale_features = []
+        for scale_index, (right_feature, ratio) in enumerate(zip(
+                right_feature_pyramid, self.compression_ratios)):
+            if self.checkpoint_scales and self.training and torch.is_grad_enabled():
+                # Bind loop variables for checkpoint's backward recomputation.
+                def run_scale(left, right, current_disp, current_offsets,
+                              normalizer, scale_ratio=ratio,
+                              current_scale_index=scale_index):
+                    return self._forward_single_scale(
+                        left, right, current_disp, current_offsets,
+                        scale_ratio, current_scale_index, normalizer
+                    )
+
+                scale_feature = checkpoint(
+                    run_scale,
+                    fmap1_low,
+                    right_feature,
+                    disp,
+                    warp_offsets,
+                    offset_normalizer,
+                    use_reentrant=False,
+                )
+            else:
+                scale_feature = self._forward_single_scale(
+                    fmap1_low,
+                    right_feature,
+                    disp,
+                    warp_offsets,
+                    ratio,
+                    scale_index,
+                    offset_normalizer,
+                )
+
+            scale_weight = scale_weights[:, scale_index:scale_index + 1].to(
+                scale_feature.dtype
+            )
+            weighted_scale_features.append(scale_feature * scale_weight)
+
+        return self.scale_fuse(torch.cat(weighted_scale_features, dim=1))
