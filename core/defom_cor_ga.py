@@ -35,6 +35,8 @@ class DEFOMStereo(nn.Module):
     4. 视差累加、范围裁剪与相关坐标保持 FP32。
     """
 
+    update_block_class = MultiPromptUpdateBlock
+
     def __init__(self, args, build_coarse_gru=True, right_width_compression_mode="conv"):
         super(DEFOMStereo, self).__init__()
         self.args = args
@@ -71,8 +73,10 @@ class DEFOMStereo(nn.Module):
 
         update_kwargs = dict(args=self.args, hidden_dim=hidden_dim, feat_dim=low_feature_dim, volume_dim=1, warp_feat_dim=low_feature_dim, cor_planes=corr_channels)
         if build_coarse_gru:
-            self.coarse_update_blocks = nn.ModuleList([MultiPromptUpdateBlock(**update_kwargs) for _ in range(3)])
-        self.refine_update_block = MultiPromptUpdateBlock(**update_kwargs)
+            self.coarse_update_blocks = nn.ModuleList([
+                self.update_block_class(**update_kwargs) for _ in range(3)
+            ])
+        self.refine_update_block = self.update_block_class(**update_kwargs)
 
         if build_coarse_gru:
             self.hypothesis_weight_head = nn.Sequential(nn.Conv2d(3 * hidden_dim + 3, hidden_dim, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(hidden_dim, 6, 1))

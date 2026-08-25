@@ -20,6 +20,8 @@ from utils.utils import *
 from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
 from core.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitEdgeStereo
 from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
+from core.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
+from core.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
 from core.defom_cor_ga import DEFOMStereo as CorGAStereo
 from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
 #from core.defom_GRU_2multi import DEFOMStereo
@@ -34,6 +36,101 @@ try:
 except ImportError:
     from torch.cuda.amp import GradScaler
     GRAD_SCALER_HAS_DEVICE_ARG = False
+
+
+@torch.no_grad()
+def clip_grad_norm_stable(parameters, max_norm):
+    """Clip an L2 gradient norm without overflowing the final FP32 reduction."""
+    parameters = [parameter for parameter in parameters if parameter.grad is not None]
+    if not parameters:
+        return torch.tensor(0.0)
+
+    parameter_norms = []
+    for parameter in parameters:
+        grad = parameter.grad.detach()
+        parameter_norm = torch.linalg.vector_norm(grad)
+        if not torch.isfinite(parameter_norm) and torch.isfinite(grad).all():
+            # A finite tensor can still overflow while its squared values are
+            # accumulated. Normalize first and restore the scale in FP64.
+            max_abs = grad.abs().max()
+            if max_abs == 0:
+                parameter_norm = max_abs.double()
+            else:
+                parameter_norm = (
+                    max_abs.double()
+                    * torch.linalg.vector_norm(grad / max_abs).double()
+                )
+        parameter_norms.append(parameter_norm.double())
+
+    total_norm = torch.linalg.vector_norm(torch.stack(parameter_norms))
+    if torch.isfinite(total_norm):
+        clip_coefficient = min(
+            1.0,
+            float(max_norm) / (total_norm.item() + 1e-6),
+        )
+        if clip_coefficient < 1.0:
+            for parameter in parameters:
+                parameter.grad.mul_(clip_coefficient)
+
+    return total_norm
+
+
+@torch.no_grad()
+def coarse_branch_valid_masks(
+    init_bins,
+    init_valid,
+    disp_gt,
+    valid,
+    downsample,
+    max_flow,
+):
+    """Return full-resolution masks within each coarse branch's valid bin range."""
+    if init_valid.ndim != 5:
+        raise ValueError(f"init_valid must be [B,R,K,H,W], got {tuple(init_valid.shape)}")
+    _, branches, bins_count, height, width = init_valid.shape
+    if tuple(init_bins.shape) != (branches, bins_count):
+        raise ValueError(
+            f"init_bins must be {(branches, bins_count)}, got {tuple(init_bins.shape)}"
+        )
+    if disp_gt.ndim != 4 or valid.shape != disp_gt.shape:
+        raise ValueError(
+            f"disp_gt/valid must have matching 4D shapes, got "
+            f"{tuple(disp_gt.shape)}/{tuple(valid.shape)}"
+        )
+
+    candidate_valid = init_valid.bool()
+    bins = init_bins.float().view(1, branches, bins_count, 1, 1)
+    expanded_bins = bins.expand_as(candidate_valid)
+    candidate_exists = candidate_valid.any(dim=2, keepdim=True)
+    minimum = expanded_bins.masked_fill(
+        ~candidate_valid, float("inf")
+    ).amin(dim=2, keepdim=True)
+    maximum = expanded_bins.masked_fill(
+        ~candidate_valid, float("-inf")
+    ).amax(dim=2, keepdim=True)
+
+    low_size = (height, width)
+    gt_low = F.interpolate(disp_gt.float(), size=low_size, mode="nearest")
+    gt_low = gt_low / float(downsample)
+    valid_low = F.interpolate(valid.float(), size=low_size, mode="nearest") >= 0.5
+    valid_low &= torch.isfinite(gt_low) & (gt_low >= 0.0)
+    valid_low &= gt_low * float(downsample) < float(max_flow)
+    gt_low = gt_low.unsqueeze(1)
+    eligible_low = candidate_exists & valid_low.unsqueeze(1)
+    eligible_low &= gt_low >= minimum
+    eligible_low &= gt_low <= maximum
+
+    eligible_full = F.interpolate(
+        eligible_low.squeeze(2).float(),
+        size=disp_gt.shape[-2:],
+        mode="nearest",
+    ) >= 0.5
+    full_valid = (valid >= 0.5) & torch.isfinite(disp_gt)
+    full_valid &= (disp_gt >= 0.0) & (disp_gt < float(max_flow))
+    return [
+        full_valid & eligible_full[:, branch:branch + 1]
+        for branch in range(branches)
+    ]
 
 
 def train(args):
@@ -81,6 +178,8 @@ def train(args):
         'cor_ga_bins2': CorGABinsNoRoPEStereo,
         'cor_ga_bins3': CorGABinsSmoothInitEdgeStereo,
         'cor_ga_bins4': CorGABinsAttentionStereo,
+        'cor_ga_bins5': CorGABins5Stereo,
+        'cor_ga_bins6': CorGABins6Stereo,
     }
     model_class = model_classes[args.model_arch]
     model = model_class(args).to(device)
@@ -222,8 +321,42 @@ def train(args):
                         use_gru_disp_grad_loss=args.use_gru_disp_grad_loss,
                         gru_grad_lambda=args.gru_grad_lambda,
                     )
-                    coarse_loss = main_loss.new_tensor(0.0)
-                    loss = main_loss
+                    if args.model_arch == 'cor_ga_bins5':
+                        coarse_valid_masks = coarse_branch_valid_masks(
+                            init_bins,
+                            aux['init_valid'],
+                            disp_gt,
+                            valid,
+                            downsample=2 ** args.n_downsample,
+                            max_flow=args.train_max_disp,
+                        )
+                        coarse_losses = []
+                        for branch_index, (branch_predictions, branch_valid) in enumerate(
+                            zip(aux['coarse_predictions'], coarse_valid_masks)
+                        ):
+                            metrics[f'coarse_valid_ratio_{branch_index}'] = (
+                                branch_valid.float().mean().item()
+                            )
+                            if branch_valid.any():
+                                coarse_losses.append(
+                                    sequence_loss_d0L1(
+                                        branch_predictions,
+                                        disp_gt,
+                                        branch_valid,
+                                        loss_gamma=args.loss_gamma,
+                                        max_flow=args.train_max_disp,
+                                        smooth_l1_beta=args.smooth_l1_beta,
+                                    )[0]
+                                )
+                        coarse_loss = (
+                            torch.stack(coarse_losses).mean()
+                            if coarse_losses
+                            else main_loss.new_tensor(0.0)
+                        )
+                        loss = main_loss + args.coarse_loss_weight * coarse_loss
+                    else:
+                        coarse_loss = main_loss.new_tensor(0.0)
+                        loss = main_loss
                 else:
                     main_loss, metrics = sequence_loss_d0L1(disp_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta)
                     coarse_losses = [sequence_loss_d0L1(branch_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta)[0] for branch_predictions in aux.get('coarse_predictions', [])]
@@ -279,7 +412,11 @@ def train(args):
                     reported_grad_stride_mismatch = True
 
             scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = (
+                clip_grad_norm_stable(model.parameters(), 1.0)
+                if args.model_arch == 'cor_ga_bins5'
+                else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            )
             if not torch.isfinite(grad_norm):
                 if scaler.is_enabled():
                     scale_before = scaler.get_scale()
@@ -382,7 +519,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='defom-stereo', help="name your experiment")
-    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins4'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins6'], help='model architecture')
 
     # resume pretrained model or resume training
     parser.add_argument('--resume_ckpt', default=None, type=str,
@@ -428,7 +565,7 @@ if __name__ == '__main__':
     # Raft Architecure choices
     parser.add_argument('--dinov2_encoder', type=str, default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--hypothesis_scales', type=float, nargs=3, default=[24.0, 48.0, 96.0],
-                        help='three quarter-resolution disparity scales applied to normalized monocular inverse depth')
+                        help='three quarter-resolution disparity scales; fixed constants for cor_ga_no_mono_head, otherwise applied to normalized monocular inverse depth')
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='exclusive upper bound of bin offsets in each compressed right-feature coordinate')
     parser.add_argument('--init_corr_scale', type=float, default=10.0, help='scale applied to cosine matching logits')

@@ -3,6 +3,7 @@ import sys
 
 import argparse
 import gc
+import pickle
 import time
 import logging
 import numpy as np
@@ -13,7 +14,10 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from core.defom_cor_ga import DEFOMStereo as CorGAStereo, autocast
 from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
+from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
+from core.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitStereo
 from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
+from core.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
 
 import core.stereo_datasets as datasets
 from core.utils.utils import InputPadder
@@ -474,7 +478,7 @@ if __name__ == '__main__':
     parser.add_argument('--scale_iters', type=int, default=20, help="number of coarse aggregation updates for each disparity hypothesis.")
 
     # Architecure choices
-    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins4'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins4', 'cor_ga_bins5'], help='model architecture')
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='maximum bin offset in each compressed right-feature coordinate')
     parser.add_argument('--init_corr_scale', type=float, default=10.0, help='scale applied to cosine matching logits')
@@ -497,7 +501,10 @@ if __name__ == '__main__':
     model_classes = {
         'cor_ga': CorGAStereo,
         'cor_ga_bins': CorGABinsStereo,
+        'cor_ga_bins2': CorGABinsNoRoPEStereo,
+        'cor_ga_bins3': CorGABinsSmoothInitStereo,
         'cor_ga_bins4': CorGABinsAttentionStereo,
+        'cor_ga_bins5': CorGABins5Stereo,
     }
     model_class = model_classes[args.model_arch]
     model = model_class(args)
@@ -508,7 +515,13 @@ if __name__ == '__main__':
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
-        checkpoint = torch.load(args.restore_ckpt, map_location='cpu', weights_only=True, mmap=True)
+        try:
+            checkpoint = torch.load(args.restore_ckpt, map_location='cpu', weights_only=True, mmap=True)
+        except pickle.UnpicklingError:
+            logging.warning(
+                "weights_only loading failed; retrying as a trusted full training checkpoint"
+            )
+            checkpoint = torch.load(args.restore_ckpt, map_location='cpu', weights_only=False, mmap=True)
         if 'model' in checkpoint:
             model.load_state_dict(checkpoint['model'])
         else:

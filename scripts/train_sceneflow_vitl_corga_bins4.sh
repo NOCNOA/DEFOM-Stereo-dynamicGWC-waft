@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODE="${1:-fresh}"
 PYTHON_BIN="${PYTHON_BIN:-/home/u2025140689/anaconda3/envs/defomstereo2/bin/python}"
-EXPERIMENT_NAME="defomstereo_vitl_corga_bins4_hypmixer_nocorr"
+EXPERIMENT_NAME="defomstereo_vitl_corga_bins4_mefa_nocorr"
 CHECKPOINT_DIR="checkpoints/${EXPERIMENT_NAME}"
 LATEST_CKPT="${CHECKPOINT_DIR}/checkpoint_latest.pth"
 

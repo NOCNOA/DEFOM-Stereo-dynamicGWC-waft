@@ -4,7 +4,11 @@ import torch.nn.functional as F
 
 from core.update_pru import MultiPromptUpdateBlock
 from core.extractor import BasicEncoder, BasicEncoder2, DefomEncoder
-from core.submodules import ParallelRightWidthCompressor, lookup_right_features3
+from core.submodules import ParallelRightWidthCompressor
+from core.mefa import (
+    MultiRangeEpipolarFeatureAugmentation,
+    MultiRangeFeatureFusionLookup,
+)
 from core.utils.utils import upflow, get_danv2_io_size
 
 
@@ -117,7 +121,7 @@ class MultiRangeBinInitializer(nn.Module):
 class DEFOMStereo(nn.Module):
     """CorGA with multi-range WAFT-style discrete disparity initialization.
     1、特征升维度
-    2、
+    2、左右图像特征增强
     #"""
     def __init__(self, args):
         super().__init__()
@@ -135,9 +139,10 @@ class DEFOMStereo(nn.Module):
                 f"got {self.refine_right_compression}"
             )
 
-        # Keep this historical module name for the bin-initialization path so
-        # existing avg/avg checkpoints remain strictly loadable. A second
-        # compressor is needed only by the off-diagonal 2x2 ablations.
+        # Keep this historical module name so the bin-initialization compressor
+        # retains stable parameter keys. The MEFA variant has its own checkpoint
+        # namespace because its refinement modules intentionally differ from
+        # earlier bins4 experiments.
         self.args = args
         self.register_buffer('mean', torch.tensor([[0.485, 0.456, 0.406]])[..., None, None] * 255)
         self.register_buffer('std', torch.tensor([[0.229, 0.224, 0.225]])[..., None, None] * 255)
@@ -149,15 +154,18 @@ class DEFOMStereo(nn.Module):
         self.defomencoder = DefomEncoder(args.dinov2_encoder)
         self.low_channel = nn.Conv2d(64, low_feature_dim, kernel_size=1)
         self.right_width_compressor = ParallelRightWidthCompressor(low_feature_dim, low_feature_dim, mode=self.init_right_compression)
-        self.refine_right_lookup = lookup_right_features3(
+        self.refine_feature_augmentation = MultiRangeEpipolarFeatureAugmentation(
+            channels=low_feature_dim,
+            num_heads=4,
+            horizontal_kernel=9,
+            layerscale_init=1e-2,
+        )
+        self.refine_right_lookup = MultiRangeFeatureFusionLookup(
             compression_ratios=(1, 2, 4),
-            group=8,
             channels=low_feature_dim,
             samples_per_scale=window_size,
-            mixer_iters=1,
-            kernel_size=3,
-            ffn_type='mlp',
-            mixer_type='static',
+            hidden_channels=64,
+            output_channels=128,
         )
         self.fnet = BasicEncoder(self.defomencoder.out_dim, output_dim=64, norm_fn='instance', downsample=2)
         self.cnet = BasicEncoder2(self.defomencoder.out_dim, output_dim=[2 * hidden_dim, hidden_dim, hidden_dim], norm_fn=args.context_norm, downsample=2)
@@ -260,6 +268,11 @@ class DEFOMStereo(nn.Module):
             initial_nets = [torch.tanh(net_4)]
             initial_nets.extend(torch.tanh(context) for context in context_pyramid[1:])
             inp_4 = torch.relu(inp_4)
+        for state_index, state in enumerate(initial_nets):
+            self._debug_require_finite(
+                f"initial_hidden[{state_index}]", state, -1
+            )
+        self._debug_require_finite("inp_4", inp_4, -1)
         with autocast(enabled=self.args.mixed_precision):
             fmap1_low = self.low_channel(fmap1_4)
             fmap2_low = self.low_channel(fmap2_4)
@@ -272,7 +285,20 @@ class DEFOMStereo(nn.Module):
             )
             init_disps = [self._bound_disparity(disp) for disp in init_disps]
             aggregation_input = torch.cat([inp_4, fmap1_low, mono_idepth1_4.float()] + init_disps + [init_confidence], dim=1)
-            weight_logits = self.initial_weight_head(aggregation_input)
+            self._debug_require_finite(
+                "initial_weight_head input", aggregation_input, -1
+            )
+            # The gate head is small, while a single FP16 overflow here
+            # invalidates both the hypothesis and scale softmaxes and then all
+            # recurrent predictions. Keep this numerically sensitive head in
+            # FP32 even when the feature encoders use mixed precision.
+            with autocast(enabled=False):
+                weight_logits = self.initial_weight_head(
+                    aggregation_input.float()
+                )
+            self._debug_require_finite(
+                "initial_weight_head output", weight_logits, -1
+            )
             hypothesis_logits = weight_logits[:, :self.num_init_ranges].float()
             hypothesis_weights = torch.softmax(hypothesis_logits, dim=1)
             scale_weights = torch.softmax(weight_logits[:, self.num_init_ranges:].float(), dim=1)
@@ -281,9 +307,6 @@ class DEFOMStereo(nn.Module):
             # every later prediction; the feature encoders remain under AMP.
             refine_nets = [state.float() for state in initial_nets]
             inp_4 = inp_4.float()
-        # for state_index, state in enumerate(refine_nets):
-        #     self._debug_require_finite(f"initial_hidden[{state_index}]", state, -1)
-        # self._debug_require_finite("inp_4", inp_4, -1)
         disp = sum(hypothesis_weights[:, index:index + 1] * init_disp.float() for index, init_disp in enumerate(init_disps))
         disp = self._bound_disparity(disp)
         del (
@@ -304,6 +327,25 @@ class DEFOMStereo(nn.Module):
             weight_logits,
             danv2_io_sizes,
         )
+
+        # MEFA is unary feature augmentation: execute it once and cache its
+        # outputs. The recurrent loop below only performs disparity-dependent
+        # sampling and left-right matching on these cached descriptors.
+        with autocast(enabled=self.args.mixed_precision):
+            fmap1_low, right_1_aug, right_2_aug, right_4_aug = (
+                self.refine_feature_augmentation(
+                    fmap1_low,
+                    refine_right_feature_pyramid[0],
+                    refine_right_feature_pyramid[1],
+                    refine_right_feature_pyramid[2],
+                )
+            )
+            refine_right_feature_pyramid = (
+                right_1_aug,
+                right_2_aug,
+                right_4_aug,
+            )
+        del right_1_aug, right_2_aug, right_4_aug
 
         d0 = disp
         disp_predictions = [upflow(d0, factor=2 ** self.args.n_downsample)]

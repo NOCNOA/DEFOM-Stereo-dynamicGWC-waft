@@ -241,3 +241,107 @@ class MultiPromptUpdateBlock(nn.Module):
 
         return net, delta_disp, mask
 
+
+
+class PromptConvGRU(nn.Module):
+    """IGEV-style ConvGRU whose external inputs carry stereo prompt features."""
+
+    def __init__(self, hidden_dim, input_dim, kernel_size=1):
+        super().__init__()
+        gate_dim = hidden_dim + input_dim
+        padding = kernel_size // 2
+        self.convz = nn.Conv2d(gate_dim, hidden_dim, kernel_size, padding=padding)
+        self.convr = nn.Conv2d(gate_dim, hidden_dim, kernel_size, padding=padding)
+        self.convq = nn.Conv2d(gate_dim, hidden_dim, kernel_size, padding=padding)
+
+    def forward(self, hidden, context_z, context_r, context_q, *inputs):
+        features = torch.cat(inputs, dim=1)
+        hidden_features = torch.cat([hidden, features], dim=1)
+        update_gate = torch.sigmoid(self.convz(hidden_features) + context_z)
+        reset_gate = torch.sigmoid(self.convr(hidden_features) + context_r)
+        candidate = torch.tanh(
+            self.convq(torch.cat([reset_gate * hidden, features], dim=1))
+            + context_q
+        )
+        return (1.0 - update_gate) * hidden + update_gate * candidate
+
+
+class MultiPromptGRUUpdateBlock(nn.Module):
+    """Multi-scale prompt update implemented with bounded ConvGRU cells."""
+
+    def __init__(self, args, hidden_dim, feat_dim, volume_dim,
+                 warp_feat_dim, cor_planes=None, num_layers=None):
+        super().__init__()
+        self.num_layers = args.n_gru_layers if num_layers is None else int(num_layers)
+        if self.num_layers < 1:
+            raise ValueError(f"num_layers must be positive, got {self.num_layers}")
+
+        self.structure_encoder = StructureEncoder(hidden_dim, 1)
+        if cor_planes is None:
+            cor_planes = args.corr_levels * (2 * args.corr_radius + 1) * volume_dim
+        self.motion_encoder = MotionEncoder(hidden_dim, cor_planes, warp_feat_dim)
+
+        input_dims = []
+        for level in range(self.num_layers):
+            if self.num_layers == 1:
+                input_dims.append(2 * hidden_dim)
+            elif level == 0:
+                input_dims.append(3 * hidden_dim)
+            elif level == self.num_layers - 1:
+                input_dims.append(hidden_dim)
+            else:
+                input_dims.append(2 * hidden_dim)
+        self.gru_layers = nn.ModuleList([
+            PromptConvGRU(hidden_dim, input_dim)
+            for input_dim in input_dims
+        ])
+
+        self.disp_head = DispHead(hidden_dim)
+        upsample_factor = 2 ** args.n_downsample
+        self.mask = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1),
+            nn.ReLU(True),
+            nn.Conv2d(hidden_dim, (upsample_factor ** 2) * 9, 1, padding=0),
+        )
+
+    def forward(self, net, context_gates, corr, disp, ctx, warp_feat, mono_disp):
+        norm_mono, _, _ = normalize_disparity(mono_disp)
+        norm_disp, _, _ = normalize_disparity(disp)
+        structure = self.structure_encoder(ctx, norm_mono - norm_disp)
+        motion = self.motion_encoder(corr, disp, warp_feat)
+
+        if len(net) != self.num_layers:
+            raise ValueError(
+                f"Expected {self.num_layers} recurrent states, got {len(net)}"
+            )
+        if len(context_gates) != self.num_layers:
+            raise ValueError(
+                f"Expected {self.num_layers} context levels, got {len(context_gates)}"
+            )
+
+        if self.num_layers == 1:
+            net[0] = self.gru_layers[0](
+                net[0], *context_gates[0], structure, motion
+            )
+        else:
+            for level in reversed(range(self.num_layers)):
+                if level == self.num_layers - 1:
+                    net[level] = self.gru_layers[level](
+                        net[level], *context_gates[level],
+                        pool2x(net[level - 1]),
+                    )
+                elif level == 0:
+                    net[level] = self.gru_layers[level](
+                        net[level], *context_gates[level], structure, motion,
+                        interp(net[level + 1], net[level]),
+                    )
+                else:
+                    net[level] = self.gru_layers[level](
+                        net[level], *context_gates[level],
+                        pool2x(net[level - 1]),
+                        interp(net[level + 1], net[level]),
+                    )
+
+        delta_disp = self.disp_head(net[0])
+        mask = 0.25 * self.mask(net[0])
+        return net, delta_disp, mask
