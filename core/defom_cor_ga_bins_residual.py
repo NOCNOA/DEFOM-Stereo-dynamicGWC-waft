@@ -6,7 +6,8 @@ from core.corr import CorrBlock1D1
 from core.update_pru import MultiPromptUpdateBlock
 from core.extractor import BasicEncoder, BasicEncoder2, DefomEncoder
 from core.galerkin import simple_attn_rope_2d
-from core.submodules import ParallelRightWidthCompressor, lookup_right_features
+from core.submodules import ParallelRightWidthCompressor, encode_sampled_right_features
+from core.warp import sample_right_feature_pyramid
 from core.utils.utils import coords_grid, upflow, get_danv2_io_size
 
 
@@ -117,13 +118,21 @@ class MultiRangeBinInitializer(nn.Module):
 
 
 class DEFOMStereo(nn.Module):
-    """
-    模型改动：
-    1.、初始化的方法：之前的太复杂而且效果并不好，直接改loss为l1损失得了
-    2、 GRU加edge loss
-    """
+    """Standalone bins residual-feature organization ablation."""
     def __init__(self, args):
         super().__init__()
+        # 相对基础模型 core/defom_cor_ga_bins.py，本消融模型只替换
+        # refinement 阶段的局部匹配特征组织方式：
+        # 1. 基础 bins 使用 [L, R_1, R_2, ..., R_K] 直接拼接；
+        # 2. 本模型对每个尺度、每个采样位置构造
+        #    [R_K-L, GWC_K]，不再额外拼接左侧特征 L；
+        # 3. GWC_K 是 4 组归一化余弦相关性，因此每个匹配编码为
+        #    32 维残差 + 4 维 GWC = 36 维；
+        # 4. 每个 36 维编码先由共享 1x1 Conv 降至 16 维，再由
+        #    相同的 w_s 融合 1/2/4 三个尺度，最后拼接 K 个位置；
+        # 5. 保留基础 bins 的 refine_right_fuse 和 RoPE；粗视差初始化、
+        #    w_h、w_s、相关体及 GRU 均不变；
+        # 6. 该类是完整独立实现，不继承基础 bins 或 bins6。
         self.init_right_compression = getattr(args, 'init_right_compression', 'avg')
         self.refine_right_compression = getattr(args, 'refine_right_compression', 'avg')
         valid_compression_modes = ('avg', 'conv')
@@ -150,11 +159,27 @@ class DEFOMStereo(nn.Module):
         low_feature_dim = 32
         hidden_dim = args.hidden_dims[0]
         window_size = 2 * self.corr_radius + 1
-        fusion_in_channels = low_feature_dim * (window_size + 1)
+        self.sampled_right_num_groups = 4
+        self.sampled_right_dim = 16
+        if low_feature_dim % self.sampled_right_num_groups != 0:
+            raise ValueError(
+                f"low feature channels ({low_feature_dim}) must be divisible "
+                f"by sampled-right groups ({self.sampled_right_num_groups})"
+            )
+        fusion_in_channels = self.sampled_right_dim * window_size
         corr_channels = self.corr_levels * window_size
         self.defomencoder = DefomEncoder(args.dinov2_encoder)
         self.low_channel = nn.Conv2d(64, low_feature_dim, kernel_size=1)
         self.right_width_compressor = ParallelRightWidthCompressor(low_feature_dim, low_feature_dim, mode=self.init_right_compression)
+        self.sampled_right_reduce = nn.Sequential(
+            nn.Conv2d(
+                low_feature_dim + self.sampled_right_num_groups,
+                self.sampled_right_dim,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.ReLU(inplace=True),
+        )
         self.refine_right_fuse = self._make_right_fuser(fusion_in_channels)
         self.refine_rope = simple_attn_rope_2d(low_feature_dim, 4)
         self.fnet = BasicEncoder(self.defomencoder.out_dim, output_dim=64, norm_fn='instance', downsample=2)
@@ -219,7 +244,68 @@ class DEFOMStereo(nn.Module):
         return CorrBlock1D1(volume, coords, num_levels=self.corr_levels, radius=self.corr_radius, coordinate_mode='right', volume_layout='full_corr')
 
     def _refine_warp_feature(self, fmap1_low, right_feature_pyramid, disp, scale_weights):
-        return lookup_right_features(fmap1_low, right_feature_pyramid, disp, warp_offsets=self.warp_offsets, feature_fuse=self.refine_right_fuse, rope_galerkin=self.refine_rope, scale_weights=scale_weights, compression_ratios=(1, 2, 4))
+        """Encode [right-left, 4-group GWC] without concatenating left features."""
+        compression_ratios = self.bin_initializer.compression_ratios
+        sampled_right = sample_right_feature_pyramid(
+            right_feature_pyramid,
+            disp,
+            offsets=self.warp_offsets,
+            compression_ratios=compression_ratios,
+            padding_mode='zeros',
+            align_corners=True,
+        )
+
+        batch, channels, height, width = fmap1_low.shape
+        num_scales = len(compression_ratios)
+        total_samples = sampled_right.shape[1]
+        if total_samples % num_scales != 0:
+            raise RuntimeError(
+                f"Cannot split {total_samples} samples into {num_scales} scales"
+            )
+        samples_per_scale = total_samples // num_scales
+        sampled_right = sampled_right.reshape(
+            batch,
+            num_scales,
+            samples_per_scale,
+            channels,
+            height,
+            width,
+        )
+
+        encoded_right = encode_sampled_right_features(
+            fmap1_low,
+            sampled_right,
+            num_groups=self.sampled_right_num_groups,
+        )
+        encoded_channels = encoded_right.shape[3]
+        encoded_right = encoded_right.reshape(
+            batch * num_scales * samples_per_scale,
+            encoded_channels,
+            height,
+            width,
+        )
+        reduced_right = self.sampled_right_reduce(encoded_right)
+        reduced_right = reduced_right.reshape(
+            batch,
+            num_scales,
+            samples_per_scale,
+            self.sampled_right_dim,
+            height,
+            width,
+        )
+
+        expected_weights = (batch, num_scales, height, width)
+        if tuple(scale_weights.shape) != expected_weights:
+            raise ValueError(
+                f"scale_weights must be {expected_weights}, "
+                f"got {tuple(scale_weights.shape)}"
+            )
+        selected_right = (
+            reduced_right
+            * scale_weights.to(reduced_right.dtype)[:, :, None, None]
+        ).sum(dim=1)
+        fused_feature = self.refine_right_fuse(selected_right.flatten(1, 2))
+        return self.refine_rope(fused_feature)
 
     def _freeze_structurally_unused_parameters(self):
         for norm_name in ('norm2', 'norm3'):

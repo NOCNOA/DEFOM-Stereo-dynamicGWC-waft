@@ -27,7 +27,8 @@ except Exception:
 class MultiRangeBinInitializer(nn.Module):
     """Estimate three initial disparities with equal-width bins over 1/2/4x ranges."""
 
-    def __init__(self, feature_dim=32, num_bins=48, max_offset=48.0, corr_scale=10.0):
+    def __init__(self, feature_dim=32, num_bins=48, max_offset=48.0,
+                 corr_scale=10.0, use_mono=True):
         super().__init__()
         if num_bins < 2:
             raise ValueError(f"num_bins must be at least 2, got {num_bins}")
@@ -35,6 +36,7 @@ class MultiRangeBinInitializer(nn.Module):
             raise ValueError(f"max_offset must be positive, got {max_offset}")
         self.num_bins = int(num_bins)
         self.corr_scale = float(corr_scale)
+        self.use_mono = bool(use_mono)
         self.compression_ratios = (1, 2, 4)
         bin_width = float(max_offset) / self.num_bins
         offsets = torch.arange(self.num_bins, dtype=torch.float32) * bin_width
@@ -42,7 +44,8 @@ class MultiRangeBinInitializer(nn.Module):
         self.bin_width = bin_width
         self.register_buffer('bin_offsets', offsets, persistent=False)
         self.register_buffer('bin_disparities', ratios[:, None] * offsets[None, :], persistent=False)
-        self.logit_refiners = nn.ModuleList([nn.Sequential(nn.Conv2d(self.num_bins + 1, feature_dim, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(feature_dim, self.num_bins, 3, padding=1)) for _ in self.compression_ratios])
+        refiner_channels = self.num_bins + int(self.use_mono)
+        self.logit_refiners = nn.ModuleList([nn.Sequential(nn.Conv2d(refiner_channels, feature_dim, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(feature_dim, self.num_bins, 3, padding=1)) for _ in self.compression_ratios])
         for refiner in self.logit_refiners:
             nn.init.zeros_(refiner[-1].weight)
             nn.init.zeros_(refiner[-1].bias)
@@ -80,11 +83,14 @@ class MultiRangeBinInitializer(nn.Module):
             logits = ((1.0 - alpha) * value0 + alpha * value1).permute(0, 3, 1, 2).contiguous()
         return logits, valid.permute(0, 3, 1, 2).expand(batch, self.num_bins, height, width)
 
-    def forward(self, left_feature, right_feature_pyramid, mono_idepth):
+    def forward(self, left_feature, right_feature_pyramid, mono_idepth=None):
         if len(right_feature_pyramid) != len(self.compression_ratios):
             raise ValueError(f"Expected {len(self.compression_ratios)} right features, got {len(right_feature_pyramid)}")
         self._require_finite("left_feature", left_feature)
-        self._require_finite("mono_idepth", mono_idepth)
+        if self.use_mono:
+            if mono_idepth is None:
+                raise ValueError("mono_idepth is required when use_mono=True")
+            self._require_finite("mono_idepth", mono_idepth)
         branch_logits = []
         branch_confidences = []
         branch_disps = []
@@ -97,7 +103,10 @@ class MultiRangeBinInitializer(nn.Module):
                 self._require_finite("right_feature", right_feature, branch_index)
                 raw_logits, valid = self._match_logits(left_feature, right_feature, ratio)
                 self._require_finite("raw_logits", raw_logits, branch_index)
-                refiner_input = torch.cat([raw_logits.masked_fill(~valid, -1.0), mono_idepth.float()], dim=1)
+                refiner_inputs = [raw_logits.masked_fill(~valid, -1.0)]
+                if self.use_mono:
+                    refiner_inputs.append(mono_idepth.float())
+                refiner_input = torch.cat(refiner_inputs, dim=1)
                 refiner_delta = self.logit_refiners[branch_index](refiner_input.float())
                 self._require_finite("refiner_delta", refiner_delta, branch_index)
                 logits = self.corr_scale * raw_logits + refiner_delta

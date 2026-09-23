@@ -13,14 +13,27 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from core.defom_cor_ga import DEFOMStereo as CorGAStereo, autocast
+from core.defom_cor_ga_coarse1 import DEFOMStereo as CorGACoarse1Stereo
+from core.defom_cor_ga_lite import DEFOMStereo as CorGALiteStereo
+from core.defom_cor_ga_fast import DEFOMStereo as CorGAFastStereo
+from core.defom_cor_ga_fast2 import DEFOMStereo as CorGAFast2Stereo
+from core.defom_cor_ga_fast3 import DEFOMStereo as CorGAFast3Stereo
+from core.defom_cor_ga_fast_pairres import DEFOMStereo as CorGAFastPairResidualStereo
+from core.defom_cor_ga_fast_bininit import DEFOMStereo as CorGAFastBinInitStereo
+from core.defom_cor_ga_fast_binmono import DEFOMStereo as CorGAFastBinMonoStereo
+from core.defom_cor_ga_noh import DEFOMStereo as CorGANoHiddenStereo
 from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
 from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
 from core.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitStereo
+from core.defom_cor_ga_bins3_gwc import DEFOMStereo as CorGABins3GWCStereo
 from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
 from core.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
+from core.defom_cor_ga_bins5_shared_parallel import DEFOMStereo as CorGABins5SharedParallelStereo
+from core.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
+from core.defom_cor_ga_bins_residual import DEFOMStereo as CorGABinsResidualStereo
 
 import core.stereo_datasets as datasets
-from core.utils.utils import InputPadder
+from core.utils.utils import InputPadder, upflow
 
 import os
 os.environ.pop("CUDNN_DISABLE", None)  # 防止环境变量禁用
@@ -111,12 +124,24 @@ def save_residual_gray_png_1hw(pred: torch.Tensor,
 
 
 @torch.no_grad()
-def validate_things(model, iters=32, scale_iters=8, mixed_prec=False, max_disp=768, bad_threshold=3.0):
+def validate_things(model, iters=32, scale_iters=8, mixed_prec=False, max_disp=768,
+                    bad_threshold=3.0, binmono_metrics=False):
     """ Peform validation using the FlyingThings3D (TEST) split """
     model.eval()
     val_dataset = datasets.SceneFlowDatasets(dstype='frames_finalpass', things_test=True)
 
     out_list, epe_list, elapsed_list = [], [], []
+    source_names = ('raw_bin', 'aligned_mono', 'fused_init')
+    branch_labels = ('1x', '2x', '4x')
+    branch_image_epes = {
+        name: [[] for _ in range(3)] for name in source_names
+    }
+    branch_abs_sums = {name: np.zeros(3) for name in source_names}
+    branch_counts = {name: np.zeros(3, dtype=np.int64) for name in source_names}
+    branch_out3 = {name: np.zeros(3, dtype=np.int64) for name in source_names}
+    confidence_sums = np.zeros(3)
+    confidence_counts = np.zeros(3, dtype=np.int64)
+
     for val_id in tqdm(range(len(val_dataset))):
         data_blob = val_dataset[val_id]
         image1 = data_blob["img1"][None].cuda()
@@ -130,7 +155,14 @@ def validate_things(model, iters=32, scale_iters=8, mixed_prec=False, max_disp=7
         #torch.save(disp_gt, "disp_gt.pth")
         with autocast(enabled=mixed_prec):
             start = time.time()
-            disp_pr = model(image1, image2, iters=iters, scale_iters=scale_iters, test_mode=True)
+            if binmono_metrics:
+                predictions, binmono_aux = model(
+                    image1, image2, iters=iters, scale_iters=scale_iters,
+                    test_mode=False, return_aux=True)
+                disp_pr = predictions[-1]
+            else:
+                disp_pr = model(
+                    image1, image2, iters=iters, scale_iters=scale_iters, test_mode=True)
             end = time.time()
         if val_id > 50:
             elapsed_list.append(end-start)
@@ -159,6 +191,33 @@ def validate_things(model, iters=32, scale_iters=8, mixed_prec=False, max_disp=7
     epe_list = np.array(epe_list)
     out_list = np.concatenate(out_list)
 
+        if binmono_metrics:
+            low_sources = {
+                'raw_bin': binmono_aux['raw_bin_disps'],
+                'aligned_mono': binmono_aux['aligned_mono_disps'],
+                'fused_init': binmono_aux['binmono_fused_disps'],
+            }
+            for source_name, low_disp in low_sources.items():
+                full_disp = padder.unpad(
+                    upflow(low_disp.float(), factor=4)
+                ).cpu().squeeze(0)
+                for branch in range(3):
+                    branch_error = torch.sum(
+                        torch.abs(full_disp[branch:branch + 1] - disp_gt), dim=0
+                    ).flatten()[val]
+                    branch_image_epes[source_name][branch].append(
+                        branch_error.mean().item())
+                    branch_abs_sums[source_name][branch] += branch_error.sum().item()
+                    branch_counts[source_name][branch] += branch_error.numel()
+                    branch_out3[source_name][branch] += (
+                        branch_error > bad_threshold).sum().item()
+            confidence = padder.unpad(F.interpolate(
+                binmono_aux['binmono_confidence'].float(), scale_factor=4,
+                mode='bilinear', align_corners=True,
+            )).cpu().squeeze(0)
+            for branch in range(3):
+                values = confidence[branch].flatten()[val]
+                confidence_sums[branch] += values.sum().item()
     epe = np.mean(epe_list)
     out = 100 * np.mean(out_list)
     avg_runtime = np.mean(elapsed_list)
@@ -478,19 +537,26 @@ if __name__ == '__main__':
     parser.add_argument('--scale_iters', type=int, default=20, help="number of coarse aggregation updates for each disparity hypothesis.")
 
     # Architecure choices
-    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins4', 'cor_ga_bins5'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_fast3', 'cor_ga_fast2', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins3_gwc', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_bins6', 'cor_ga_bins_residual'], help='model architecture')
+    parser.add_argument('--amp_dtype', choices=['fp16', 'bf16'], default='fp16', help='autocast dtype used inside models with --mixed_precision')
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='maximum bin offset in each compressed right-feature coordinate')
     parser.add_argument('--init_corr_scale', type=float, default=10.0, help='scale applied to cosine matching logits')
+    parser.add_argument('--init_gwc_groups', type=int, default=8, help='channel groups used by cor_ga_bins3_gwc initialization')
+    parser.add_argument('--init_gwc_hidden', type=int, default=32, help='hidden width of the shared per-bin GWC detector')
+    parser.add_argument('--binmono_conf_hidden', type=int, default=32, help='hidden channels in the shared bin/mono confidence head')
+    parser.add_argument('--binmono_init_stereo_weight', type=float, default=0.05, help='initial stereo-bin weight used by cor_ga_fast_binmono')
     parser.add_argument('--max_delta_disp', type=float, default=8.0, help='smooth per-iteration disparity-update limit in quarter-resolution pixels')
     parser.add_argument('--dinov2_encoder', type=str, default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--hypothesis_scales', type=float, nargs=3, default=[24.0, 48.0, 96.0],
-                        help='three quarter-resolution disparity scales applied to normalized monocular inverse depth')
+                        help='three quarter-resolution disparity scales; fixed constants for cor_ga_no_mono_head, otherwise applied to normalized monocular inverse depth')
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128], help="quarter-resolution hidden state and context dimension")
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
     parser.add_argument('--shared_backbone', action='store_true', help="use a single backbone for the context and feature encoders")
     parser.add_argument('--corr_levels', type=int, default=2, help="number of levels in the shared right-coordinate FullCorr pyramid")
     parser.add_argument('--corr_radius', type=int, default=4, help="shared local radius for FullCorr and right-feature window sampling")
+    parser.add_argument('--pair_feature_dim', type=int, default=8, help='candidate-pair token width used by cor_ga_fast_pairres')
+    parser.add_argument('--pair_residual_init_std', type=float, default=1e-4, help='pair residual output initialization std stored for architecture reproducibility')
 
     parser.add_argument('--n_downsample', type=int, default=2, choices=[2], help="fixed quarter-resolution disparity field")
     parser.add_argument('--context_norm', type=str, default="batch", choices=['group', 'batch', 'instance', 'none'], help="normalization of context encoder")
@@ -499,12 +565,25 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     model_classes = {
+        'cor_ga_coarse1': CorGACoarse1Stereo,
+        'cor_ga_lite': CorGALiteStereo,
         'cor_ga': CorGAStereo,
+        'cor_ga_fast': CorGAFastStereo,
+        'cor_ga_fast2': CorGAFast2Stereo,
+        'cor_ga_fast3': CorGAFast3Stereo,
+        'cor_ga_fast_pairres': CorGAFastPairResidualStereo,
+        'cor_ga_fast_bininit': CorGAFastBinInitStereo,
+        'cor_ga_fast_binmono': CorGAFastBinMonoStereo,
+        'cor_ga_noh': CorGANoHiddenStereo,
         'cor_ga_bins': CorGABinsStereo,
         'cor_ga_bins2': CorGABinsNoRoPEStereo,
         'cor_ga_bins3': CorGABinsSmoothInitStereo,
+        'cor_ga_bins3_gwc': CorGABins3GWCStereo,
         'cor_ga_bins4': CorGABinsAttentionStereo,
         'cor_ga_bins5': CorGABins5Stereo,
+        'cor_ga_bins5_shared_parallel': CorGABins5SharedParallelStereo,
+        'cor_ga_bins6': CorGABins6Stereo,
+        'cor_ga_bins_residual': CorGABinsResidualStereo,
     }
     model_class = model_classes[args.model_arch]
     model = model_class(args)
@@ -522,10 +601,8 @@ if __name__ == '__main__':
                 "weights_only loading failed; retrying as a trusted full training checkpoint"
             )
             checkpoint = torch.load(args.restore_ckpt, map_location='cpu', weights_only=False, mmap=True)
-        if 'model' in checkpoint:
-            model.load_state_dict(checkpoint['model'])
-        else:
-            model.load_state_dict(checkpoint)
+        state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
         del checkpoint
         gc.collect()
         logging.info(f"Done loading checkpoint")

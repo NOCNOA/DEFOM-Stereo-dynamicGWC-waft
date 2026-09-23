@@ -36,8 +36,10 @@ class DEFOMStereo(nn.Module):
     """
 
     update_block_class = MultiPromptUpdateBlock
+    use_mono_head = True
 
-    def __init__(self, args, build_coarse_gru=True, right_width_compression_mode="conv"):
+    def __init__(self, args, build_coarse_gru=True,
+                 right_width_compression_mode="conv", coarse_gru_layers=None):
         super(DEFOMStereo, self).__init__()
         self.args = args
         self.register_buffer('mean', torch.tensor([[0.485, 0.456, 0.406]])[..., None, None] * 255)
@@ -45,7 +47,9 @@ class DEFOMStereo(nn.Module):
         self.amp_dtype = torch.bfloat16 if amp_dtype_name == 'bf16' else torch.float16
         self.register_buffer('std', torch.tensor([[0.229, 0.224, 0.225]])[..., None, None] * 255)
 
-        self.defomencoder = DefomEncoder(args.dinov2_encoder)
+        self.defomencoder = DefomEncoder(
+            args.dinov2_encoder, use_mono_head=self.use_mono_head
+        )
         self.corr_levels = int(args.corr_levels)
         self.corr_radius = int(args.corr_radius)
 
@@ -73,14 +77,28 @@ class DEFOMStereo(nn.Module):
 
         update_kwargs = dict(args=self.args, hidden_dim=hidden_dim, feat_dim=low_feature_dim, volume_dim=1, warp_feat_dim=low_feature_dim, cor_planes=corr_channels)
         if build_coarse_gru:
+            self.coarse_gru_layers = (
+                args.n_gru_layers
+                if coarse_gru_layers is None else int(coarse_gru_layers)
+            )
+            if not 1 <= self.coarse_gru_layers <= args.n_gru_layers:
+                raise ValueError(
+                    "coarse_gru_layers must be within [1, n_gru_layers], got "
+                    f"{self.coarse_gru_layers} and {args.n_gru_layers}"
+                )
             self.coarse_update_blocks = nn.ModuleList([
-                self.update_block_class(**update_kwargs) for _ in range(3)
+                self.update_block_class(
+                    **update_kwargs, num_layers=self.coarse_gru_layers
+                ) for _ in range(3)
             ])
         self.refine_update_block = self.update_block_class(**update_kwargs)
 
         if build_coarse_gru:
             self.hypothesis_weight_head = nn.Sequential(nn.Conv2d(3 * hidden_dim + 3, hidden_dim, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(hidden_dim, 6, 1))
-            self.refine_state_projections = nn.ModuleList([nn.Conv2d(3 * hidden_dim, hidden_dim, 1) for _ in range(args.n_gru_layers)])
+            self.refine_state_projections = nn.ModuleList([
+                nn.Conv2d(3 * hidden_dim, hidden_dim, 1)
+                for _ in range(self.coarse_gru_layers)
+            ])
 
     @staticmethod
     def _make_right_fuser(in_channels):
@@ -129,7 +147,35 @@ class DEFOMStereo(nn.Module):
     def _refine_warp_feature(self, fmap1_low, right_feature_pyramid, disp, scale_weights):
         return lookup_right_features(fmap1_low, right_feature_pyramid, disp, warp_offsets=self.warp_offsets, feature_fuse=self.refine_right_fuse, rope_galerkin=self.refine_rope, scale_weights=scale_weights, compression_ratios=(1, 2, 4))
 
-    def forward(self, image1, image2, iters=12, scale_iters=3, test_mode=False, return_aux=False):
+    def forward(self, image1, image2, iters=12, scale_iters=3, test_mode=False,
+                return_aux=False, coarse_ablation=None):
+        """Run CorGA, optionally intervening on the coarse-to-refine interface.
+
+        ``coarse_ablation`` supports diagnostics and controlled ablation models.
+        The default ``None`` preserves the training and evaluation path exactly.
+        Supported keys are:
+
+        - ``active_branches``: iterable of coarse branch indices to update;
+        - ``branch_scale_iters``: per-branch iteration-count overrides;
+        - ``use_initial_disparities``: form d0 from pre-coarse disparities;
+        - ``use_context_hidden``: initialize refinement from context states;
+        - ``uniform_scale_weights``: replace w_s with uniform weights.
+        """
+        ablation = {} if coarse_ablation is None else dict(coarse_ablation)
+        active_branches = ablation.get('active_branches')
+        if active_branches is not None:
+            active_branches = {int(index) for index in active_branches}
+            invalid_branches = active_branches.difference(range(3))
+            if invalid_branches:
+                raise ValueError(f"Invalid active coarse branches: {sorted(invalid_branches)}")
+        branch_scale_iters = {
+            int(index): int(count)
+            for index, count in ablation.get('branch_scale_iters', {}).items()
+        }
+        if any(index not in range(3) for index in branch_scale_iters):
+            raise ValueError(f"Invalid branch_scale_iters keys: {sorted(branch_scale_iters)}")
+        if any(count < 0 for count in branch_scale_iters.values()):
+            raise ValueError("branch_scale_iters values must be non-negative")
         _, _, image_height, image_width = image1.shape
         image1 = ((image1 - self.mean) / self.std).contiguous().float()
         image2 = ((image2 - self.mean) / self.std).contiguous().float()
@@ -155,11 +201,15 @@ class DEFOMStereo(nn.Module):
         right_feature_pyramid = (fmap2_low, fmap2_half, fmap2_quarter)
         del image1, image2, dfeat1_4, dfeat2_4, fmap1_4, fmap2_4, context_pyramid, net_4
 
-        coarse_nets = [[state.clone() for state in initial_nets] for _ in range(3)]
+        coarse_nets = [
+            [state.clone() for state in initial_nets[:self.coarse_gru_layers]]
+            for _ in range(3)
+        ]
         coarse_disps = [
             mono_idepth1_4 * self.hypothesis_scales[index]
             for index in range(3)
         ]
+        initial_coarse_disps = list(coarse_disps)
         coarse_predictions = [
             [upflow(disp, factor=2 ** self.args.n_downsample)]
             for disp in coarse_disps
@@ -169,7 +219,10 @@ class DEFOMStereo(nn.Module):
             disp = coarse_disps[branch_index]
             mono_prompt = disp
             net = coarse_nets[branch_index]
-            for coarse_iteration in range(scale_iters):
+            branch_iterations = branch_scale_iters.get(branch_index, scale_iters)
+            if active_branches is not None and branch_index not in active_branches:
+                branch_iterations = 0
+            for coarse_iteration in range(branch_iterations):
                 disp = disp.detach()
                 corr = full_corr(disp)
                 with autocast(enabled=self.args.mixed_precision, dtype=self.amp_dtype):
@@ -191,13 +244,32 @@ class DEFOMStereo(nn.Module):
             weight_logits = self.hypothesis_weight_head(aggregation_input)
             hypothesis_weights = torch.softmax(weight_logits[:, :3], dim=1)
             scale_weights = torch.softmax(weight_logits[:, 3:], dim=1)
-            refine_nets = [
-                projection(torch.cat(
-                    [coarse_nets[index][level].float() for index in range(3)], dim=1))
-                for level, projection in enumerate(self.refine_state_projections)
-            ]
+            if ablation.get('use_context_hidden', False):
+                refine_nets = [state.float() for state in initial_nets]
+            else:
+                refine_nets = []
+                for level in range(self.args.n_gru_layers):
+                    if level < self.coarse_gru_layers:
+                        projection = self.refine_state_projections[level]
+                        refine_nets.append(projection(torch.cat(
+                            [coarse_nets[index][level].float() for index in range(3)],
+                            dim=1,
+                        )))
+                    else:
+                        refine_nets.append(initial_nets[level].float())
 
-        disp = sum(hypothesis_weights[:, index:index + 1].float() * coarse_disps[index].float() for index in range(3))
+        if ablation.get('uniform_scale_weights', False):
+            scale_weights = torch.full_like(scale_weights, 1.0 / scale_weights.shape[1])
+
+        disparity_sources = (
+            initial_coarse_disps
+            if ablation.get('use_initial_disparities', False)
+            else coarse_disps
+        )
+        disp = sum(
+            hypothesis_weights[:, index:index + 1].float() * disparity_sources[index].float()
+            for index in range(3)
+        )
         disp = self._bound_disparity(disp)
         del aggregation_input, weight_logits
 
@@ -230,5 +302,10 @@ class DEFOMStereo(nn.Module):
                 'w_h': hypothesis_weights,
                 'w_s': scale_weights,
             }
+            if coarse_ablation is not None:
+                aux['coarse_disps'] = torch.cat(
+                    [value.float() for value in coarse_disps], dim=1)
+                aux['initial_coarse_disps'] = torch.cat(
+                    [value.float() for value in initial_coarse_disps], dim=1)
             return disp_predictions, aux
         return disp_predictions

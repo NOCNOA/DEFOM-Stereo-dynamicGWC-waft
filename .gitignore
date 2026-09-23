@@ -19,6 +19,7 @@ Thumbs.db
 nohup.out
 nohup*.out
 nohups/
+*.md 
 
 # Model weights / checkpoints
 checkpoints/

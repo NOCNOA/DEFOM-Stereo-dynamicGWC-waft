@@ -274,6 +274,50 @@ class CorrBlock1D1:
         out_pyramid = torch.cat(out_pyramid, dim=-1) #B, H, W, 33 * (2*r+1) * num_levels/ 33 * (2*r+1) * len(scale_list)
         return out_pyramid.permute(0, 3, 1, 2).contiguous().float()
 
+    def sample_many(self, disparities):
+        """Sample several disparity fields in one grid_sample per level.
+
+        The returned tensor is [S,B,C,H,W], where C matches one regular
+        ``__call__`` result. This is an execution-only batching path used by
+        CorGA-fast; the stored correlation pyramid and model parameters are
+        unchanged.
+        """
+        disparities = tuple(disparities)
+        if not disparities:
+            raise ValueError("sample_many requires at least one disparity field")
+        if self.coordinate_mode != 'right':
+            raise ValueError("sample_many currently supports right-coordinate volumes only")
+
+        branch_count = len(disparities)
+        pixel_count = self.batch * self.h1 * self.w1
+        disparity = torch.stack([value.float() for value in disparities])
+        disparity = disparity.reshape(branch_count, pixel_count, 1, 1)
+        coords = self.coords.reshape(1, pixel_count, 1, 1)
+        offsets = self.dx.reshape(1, 1, -1, 1)
+        samples_per_level = offsets.shape[2]
+        outputs = []
+
+        for level, volume in enumerate(self.volume_pyramid):
+            x0 = offsets + (coords - disparity) / (2 ** level)
+            y0 = torch.zeros_like(x0)
+            grid = torch.stack([x0, y0], dim=-1)
+            grid = grid.permute(1, 0, 2, 3, 4).reshape(
+                pixel_count, branch_count * samples_per_level, 1, 2
+            ).float()
+            sampled = bilinear_sampler(volume, grid)
+            channels = sampled.shape[1]
+            sampled = sampled.reshape(
+                pixel_count, channels, branch_count, samples_per_level
+            ).permute(2, 0, 1, 3)
+            sampled = sampled.reshape(
+                branch_count, self.batch, self.h1, self.w1,
+                channels * samples_per_level,
+            )
+            outputs.append(sampled)
+
+        outputs = torch.cat(outputs, dim=-1)
+        return outputs.permute(0, 1, 4, 2, 3).contiguous().float()
+
     @staticmethod
     def corr(fmap1, fmap2):
         B, D, H, W1 = fmap1.shape

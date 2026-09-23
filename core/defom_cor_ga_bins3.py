@@ -127,17 +127,6 @@ class DEFOMStereo(nn.Module):
         self.init_right_compression = getattr(args, 'init_right_compression', 'avg')
         self.refine_right_compression = getattr(args, 'refine_right_compression', 'avg')
         valid_compression_modes = ('avg', 'conv')
-        if self.init_right_compression not in valid_compression_modes:
-            raise ValueError(
-                f"init_right_compression must be one of {valid_compression_modes}, "
-                f"got {self.init_right_compression}"
-            )
-        if self.refine_right_compression not in valid_compression_modes:
-            raise ValueError(
-                f"refine_right_compression must be one of {valid_compression_modes}, "
-                f"got {self.refine_right_compression}"
-            )
-
         # Keep this historical module name for the bin-initialization path so
         # existing avg/avg checkpoints remain strictly loadable. A second
         # compressor is needed only by the off-diagonal 2x2 ablations.

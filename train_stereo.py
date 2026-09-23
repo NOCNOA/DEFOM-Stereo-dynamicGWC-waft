@@ -19,10 +19,26 @@ from utils.dist_utils import get_dist_info, init_dist, setup_for_distributed
 from utils.utils import *
 from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
 from core.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitEdgeStereo
+from core.defom_cor_ga_bins3_gwc import DEFOMStereo as CorGABins3GWCStereo
 from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
 from core.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
+from core.defom_cor_ga_bins5_shared_parallel import DEFOMStereo as CorGABins5SharedParallelStereo
 from core.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
+from core.defom_cor_ga_bins_residual import DEFOMStereo as CorGABinsResidualStereo
 from core.defom_cor_ga import DEFOMStereo as CorGAStereo
+from core.defom_cor_ga_coarse1 import DEFOMStereo as CorGACoarse1Stereo
+from core.defom_cor_ga_lite import DEFOMStereo as CorGALiteStereo
+from core.defom_cor_ga_fast import DEFOMStereo as CorGAFastStereo
+from core.defom_cor_ga_fast2 import DEFOMStereo as CorGAFast2Stereo
+from core.defom_cor_ga_fast3 import DEFOMStereo as CorGAFast3Stereo
+from core.defom_cor_ga_no_mono_head import DEFOMStereo as CorGANoMonoHeadStereo
+from core.defom_cor_ga_no_mono_igev import DEFOMStereo as CorGANoMonoIGEVStereo
+from core.defom_cor_ga_stereo_igev import DEFOMStereo as CorGAStereoIGEVStereo
+from core.defom_cor_ga_fast_pairres import DEFOMStereo as CorGAFastPairResidualStereo
+from core.defom_cor_ga_fast_bininit import DEFOMStereo as CorGAFastBinInitStereo
+from core.defom_cor_ga_fast_binmono import DEFOMStereo as CorGAFastBinMonoStereo
+from core.defom_cor_ga_fast_binmono_corrstats import DEFOMStereo as CorGAFastBinMonoCorrStatsStereo
+from core.defom_cor_ga_noh import DEFOMStereo as CorGANoHiddenStereo
 from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
 #from core.defom_GRU_2multi import DEFOMStereo
 #from core.defom_onlygwc import DEFOMStereo
@@ -39,30 +55,31 @@ except ImportError:
 
 
 @torch.no_grad()
-def clip_grad_norm_stable(parameters, max_norm):
-    """Clip an L2 gradient norm without overflowing the final FP32 reduction."""
+def clip_grad_norm_stable(parameters, max_norm, chunk_elements=1048576):
+    """Clip an L2 gradient norm with bounded temporary memory and FP64 reduction."""
     parameters = [parameter for parameter in parameters if parameter.grad is not None]
     if not parameters:
         return torch.tensor(0.0)
+    if chunk_elements < 1:
+        raise ValueError(f"chunk_elements must be positive, got {chunk_elements}")
 
-    parameter_norms = []
+    chunk_norms = []
     for parameter in parameters:
-        grad = parameter.grad.detach()
-        parameter_norm = torch.linalg.vector_norm(grad)
-        if not torch.isfinite(parameter_norm) and torch.isfinite(grad).all():
-            # A finite tensor can still overflow while its squared values are
-            # accumulated. Normalize first and restore the scale in FP64.
-            max_abs = grad.abs().max()
-            if max_abs == 0:
-                parameter_norm = max_abs.double()
-            else:
-                parameter_norm = (
-                    max_abs.double()
-                    * torch.linalg.vector_norm(grad / max_abs).double()
-                )
-        parameter_norms.append(parameter_norm.double())
+        flat_grad = parameter.grad.detach().reshape(-1)
+        for start in range(0, flat_grad.numel(), chunk_elements):
+            chunk = flat_grad[start:start + chunk_elements]
+            max_abs = chunk.abs().amax()
+            safe_scale = torch.where(
+                torch.isfinite(max_abs) & (max_abs > 0),
+                max_abs,
+                torch.ones_like(max_abs),
+            )
+            chunk_norms.append(
+                torch.linalg.vector_norm(chunk / safe_scale).double()
+                * safe_scale.double()
+            )
 
-    total_norm = torch.linalg.vector_norm(torch.stack(parameter_norms))
+    total_norm = torch.linalg.vector_norm(torch.stack(chunk_norms))
     if torch.isfinite(total_norm):
         clip_coefficient = min(
             1.0,
@@ -136,6 +153,8 @@ def coarse_branch_valid_masks(
 def train(args):
 
     seed_everything(args.seed)
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # if args.train_max_disp <= 0 or args.eval_max_disp <= 0:
     #     raise ValueError(f"train_max_disp and eval_max_disp must be positive, got {args.train_max_disp} and {args.eval_max_disp}")
@@ -173,13 +192,29 @@ def train(args):
     #     setup_for_distributed(args.local_rank == 0)
 
     model_classes = {
+        'cor_ga_coarse1': CorGACoarse1Stereo,
+        'cor_ga_lite': CorGALiteStereo,
         'cor_ga': CorGAStereo,
+        'cor_ga_fast': CorGAFastStereo,
+        'cor_ga_fast2': CorGAFast2Stereo,
+        'cor_ga_fast3': CorGAFast3Stereo,
+        'cor_ga_no_mono_head': CorGANoMonoHeadStereo,
+        'cor_ga_no_mono_igev': CorGANoMonoIGEVStereo,
+        'cor_ga_stereo_igev': CorGAStereoIGEVStereo,
+        'cor_ga_fast_pairres': CorGAFastPairResidualStereo,
+        'cor_ga_fast_bininit': CorGAFastBinInitStereo,
+        'cor_ga_fast_binmono': CorGAFastBinMonoStereo,
+        'cor_ga_fast_binmono_corrstats': CorGAFastBinMonoCorrStatsStereo,
+        'cor_ga_noh': CorGANoHiddenStereo,
         'cor_ga_bins': CorGABinsStereo,
         'cor_ga_bins2': CorGABinsNoRoPEStereo,
         'cor_ga_bins3': CorGABinsSmoothInitEdgeStereo,
+        'cor_ga_bins3_gwc': CorGABins3GWCStereo,
         'cor_ga_bins4': CorGABinsAttentionStereo,
         'cor_ga_bins5': CorGABins5Stereo,
+        'cor_ga_bins5_shared_parallel': CorGABins5SharedParallelStereo,
         'cor_ga_bins6': CorGABins6Stereo,
+        'cor_ga_bins_residual': CorGABinsResidualStereo,
     }
     model_class = model_classes[args.model_arch]
     model = model_class(args).to(device)
@@ -213,7 +248,7 @@ def train(args):
               else GradScaler(enabled=scaler_enabled, init_scale=args.amp_init_scale))
 
     if args.resume_ckpt:
-        assert args.resume_ckpt.endswith(".pth")
+        assert args.resume_ckpt.endswith((".pth", ".pth.gz"))
         logging.info("Loading checkpoint: %s" % args.resume_ckpt)
         checkpoint = torch.load(args.resume_ckpt, map_location='cpu', weights_only=False, mmap=True)
         if 'model' in checkpoint:
@@ -259,9 +294,13 @@ def train(args):
     else:
         train_sampler = None
     
+    loader_worker_options = (
+        {'persistent_workers': True, 'prefetch_factor': 2}
+        if args.num_workers > 0 else {}
+    )
     train_loader = DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=train_sampler is None,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
-                              sampler=train_sampler)
+                              sampler=train_sampler, **loader_worker_options)
 
     total_steps = start_step
     epoch = start_epoch
@@ -274,6 +313,9 @@ def train(args):
     should_keep_training = total_steps < args.num_steps
     reported_grad_stride_mismatch = False
     amp_overflow_count = 0
+    nonfinite_gradient_count = 0
+    large_gradient_count = 0
+    accumulated_microbatches = 0
 
     while should_keep_training:
 
@@ -282,11 +324,12 @@ def train(args):
             train_sampler.set_epoch(epoch)
 
         for i_batch, data_blob in enumerate(tqdm(train_loader)):
-            optimizer.zero_grad(set_to_none=True)
-            image1 = data_blob["img1"].cuda()
-            image2 = data_blob["img2"].cuda()
-            disp_gt = data_blob["disp"].cuda()
-            valid = data_blob["valid"].cuda()
+            if accumulated_microbatches == 0:
+                optimizer.zero_grad(set_to_none=True)
+            image1 = data_blob["img1"].cuda(non_blocking=True)
+            image2 = data_blob["img2"].cuda(non_blocking=True)
+            disp_gt = data_blob["disp"].cuda(non_blocking=True)
+            valid = data_blob["valid"].cuda(non_blocking=True)
 
             disp_predictions, aux = [], {}
             try:
@@ -295,7 +338,7 @@ def train(args):
                 assert model.training
                 if 'init_disps' in aux:
                     init_bins = model_without_ddp.bin_initializer.bin_disparities
-                    main_loss, metrics = (sequence_loss_multi_init_smooth_l1_edge if args.model_arch == 'cor_ga_bins3' else sequence_loss_multi_init_waft)(
+                    main_loss, metrics = (sequence_loss_multi_init_smooth_l1_edge if args.model_arch in ('cor_ga_bins3', 'cor_ga_bins3_gwc') else sequence_loss_multi_init_waft)(
                         aux['init_disps'],
                         aux['init_logits'],
                         aux['w_h_logits'],
@@ -320,8 +363,10 @@ def train(args):
                         gru_edge_lambda=args.gru_edge_lambda,
                         use_gru_disp_grad_loss=args.use_gru_disp_grad_loss,
                         gru_grad_lambda=args.gru_grad_lambda,
+                        init_branch_loss_weight=args.init_branch_loss_weight,
+                        debug_finite=args.debug_nan,
                     )
-                    if args.model_arch == 'cor_ga_bins5':
+                    if args.model_arch in ('cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_fast_bininit', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_fast_binmono', 'cor_ga_fast_binmono_corrstats'):
                         coarse_valid_masks = coarse_branch_valid_masks(
                             init_bins,
                             aux['init_valid'],
@@ -335,19 +380,19 @@ def train(args):
                             zip(aux['coarse_predictions'], coarse_valid_masks)
                         ):
                             metrics[f'coarse_valid_ratio_{branch_index}'] = (
-                                branch_valid.float().mean().item()
+                                branch_valid.float().mean().detach()
                             )
-                            if branch_valid.any():
-                                coarse_losses.append(
-                                    sequence_loss_d0L1(
-                                        branch_predictions,
-                                        disp_gt,
-                                        branch_valid,
-                                        loss_gamma=args.loss_gamma,
-                                        max_flow=args.train_max_disp,
-                                        smooth_l1_beta=args.smooth_l1_beta,
-                                    )[0]
-                                )
+                            coarse_losses.append(
+                                sequence_loss_d0L1(
+                                    branch_predictions,
+                                    disp_gt,
+                                    branch_valid,
+                                    loss_gamma=args.loss_gamma,
+                                    max_flow=args.train_max_disp,
+                                    smooth_l1_beta=args.smooth_l1_beta,
+                                    debug_finite=args.debug_nan,
+                                )[0]
+                            )
                         coarse_loss = (
                             torch.stack(coarse_losses).mean()
                             if coarse_losses
@@ -358,8 +403,8 @@ def train(args):
                         coarse_loss = main_loss.new_tensor(0.0)
                         loss = main_loss
                 else:
-                    main_loss, metrics = sequence_loss_d0L1(disp_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta)
-                    coarse_losses = [sequence_loss_d0L1(branch_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta)[0] for branch_predictions in aux.get('coarse_predictions', [])]
+                    main_loss, metrics = sequence_loss_d0L1(disp_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta, debug_finite=args.debug_nan)
+                    coarse_losses = [sequence_loss_d0L1(branch_predictions, disp_gt, valid, loss_gamma=args.loss_gamma, max_flow=args.train_max_disp, smooth_l1_beta=args.smooth_l1_beta, debug_finite=args.debug_nan)[0] for branch_predictions in aux.get('coarse_predictions', [])]
                     coarse_loss = torch.stack(coarse_losses).mean() if coarse_losses else main_loss.new_tensor(0.0)
                     loss = main_loss + args.coarse_loss_weight * coarse_loss
             except (AssertionError, FloatingPointError) as error:
@@ -389,12 +434,19 @@ def train(args):
                     torch.save({'step': total_steps, 'model': model_without_ddp.state_dict()}, failure_model_path)
                     logging.exception("Non-finite failure (%s) in %s; batch saved to %s and model saved to %s", error, ', '.join(nonfinite_outputs) or 'stage reported by exception', failure_batch_path.absolute(), failure_model_path.absolute())
                 raise
-            metrics['main_loss'] = main_loss.detach().item()
-            metrics['coarse_loss'] = coarse_loss.detach().item()
-            metrics['init_loss'] = float(metrics.get('init_soft_ce', 0.0))
-            metrics['total_loss'] = loss.detach().item()
+            metrics['main_loss'] = main_loss.detach()
+            metrics['coarse_loss'] = coarse_loss.detach()
+            init_metric = metrics.get('init_soft_ce', 0.0)
+            metrics['init_loss'] = (
+                init_metric.detach()
+                if torch.is_tensor(init_metric) else float(init_metric)
+            )
+            metrics['total_loss'] = loss.detach()
 
-            scaler.scale(loss).backward()
+            scaler.scale(loss / args.gradient_accumulation_steps).backward()
+            accumulated_microbatches += 1
+            if accumulated_microbatches < args.gradient_accumulation_steps:
+                continue
 
             if (not reported_grad_stride_mismatch) and args.distributed and args.local_rank == 0:
                 mismatch_lines = []
@@ -412,12 +464,49 @@ def train(args):
                     reported_grad_stride_mismatch = True
 
             scaler.unscale_(optimizer)
+            stable_clip_architectures = (
+                'cor_ga',
+                'cor_ga_fast',
+                'cor_ga_fast2',
+                'cor_ga_fast3',
+                'cor_ga_no_mono_head',
+                'cor_ga_no_mono_igev',
+                'cor_ga_stereo_igev',
+                'cor_ga_fast_pairres',
+                'cor_ga_fast_bininit',
+                'cor_ga_fast_binmono',
+                'cor_ga_fast_binmono_corrstats',
+                'cor_ga_bins5',
+                'cor_ga_bins5_shared_parallel',
+                'cor_ga_noh',
+                'cor_ga_coarse1',
+                'cor_ga_lite',
+            )
             grad_norm = (
                 clip_grad_norm_stable(model.parameters(), 1.0)
-                if args.model_arch == 'cor_ga_bins5'
+                if args.model_arch in stable_clip_architectures
                 else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             )
-            if not torch.isfinite(grad_norm):
+            grad_norm_value = grad_norm.detach().item()
+            metrics['grad_norm'] = grad_norm_value
+            grad_norm_is_finite = np.isfinite(grad_norm_value)
+            if (
+                grad_norm_is_finite
+                and args.large_grad_warn_threshold > 0
+                and grad_norm_value > args.large_grad_warn_threshold
+            ):
+                large_gradient_count += 1
+                if args.local_rank == 0 and (
+                    large_gradient_count == 1 or large_gradient_count % 100 == 0
+                ):
+                    logging.warning(
+                        "Large finite gradient #%d at optimizer step %d "
+                        "(stable pre-clip norm=%.6e); gradients clipped to 1.0",
+                        large_gradient_count,
+                        total_steps,
+                        grad_norm_value,
+                    )
+            if not grad_norm_is_finite:
                 if scaler.is_enabled():
                     scale_before = scaler.get_scale()
                     # unscale_() has already recorded the non-finite gradients.
@@ -428,6 +517,7 @@ def train(args):
                     scale_after = scaler.get_scale()
                     amp_overflow_count += 1
                     optimizer.zero_grad(set_to_none=True)
+                    accumulated_microbatches = 0
                     if args.local_rank == 0 and (amp_overflow_count == 1 or amp_overflow_count % 10 == 0):
                         logging.warning(
                             "AMP gradient overflow #%d at optimizer step %d "
@@ -440,11 +530,33 @@ def train(args):
                         )
                     continue
 
-                if args.local_rank == 0:
+                nonfinite_gradient_count += 1
+                save_failure_snapshot = (
+                    args.local_rank == 0
+                    and (not args.skip_nonfinite_gradients or nonfinite_gradient_count == 1)
+                )
+                if save_failure_snapshot:
                     failure_batch_path = Path('checkpoints/%s/nonfinite_gradient_batch_step_%d.pth' % (args.name, total_steps))
                     failure_model_path = Path('checkpoints/%s/nonfinite_gradient_model_step_%d.pth' % (args.name, total_steps))
                     torch.save({'step': total_steps, 'grad_norm': grad_norm.detach().cpu(), 'image1': image1.detach().cpu(), 'image2': image2.detach().cpu(), 'disp_gt': disp_gt.detach().cpu(), 'valid': valid.detach().cpu()}, failure_batch_path)
                     torch.save({'step': total_steps, 'model': model_without_ddp.state_dict()}, failure_model_path)
+                if args.skip_nonfinite_gradients:
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulated_microbatches = 0
+                    if args.local_rank == 0:
+                        logging.warning(
+                            "Non-finite gradient #%d at optimizer step %d; batch skipped, "
+                            "optimizer and scheduler held%s",
+                            nonfinite_gradient_count,
+                            total_steps,
+                            (
+                                f"; batch saved to {failure_batch_path.absolute()} and "
+                                f"model saved to {failure_model_path.absolute()}"
+                                if save_failure_snapshot else ""
+                            ),
+                        )
+                    continue
+                if args.local_rank == 0:
                     logging.error("Non-finite gradient norm %s at optimizer step %d; stopping before optimizer update. Batch saved to %s and model saved to %s", grad_norm.detach().item(), total_steps, failure_batch_path.absolute(), failure_model_path.absolute())
                 raise FloatingPointError(f"Non-finite gradient norm at optimizer step {total_steps}: {grad_norm.detach().item()}")
 
@@ -454,15 +566,21 @@ def train(args):
             optimizer_stepped = (not scaler.is_enabled()) or scaler.get_scale() >= scale_before
             if not optimizer_stepped:
                 amp_overflow_count += 1
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_microbatches = 0
                 if args.local_rank == 0 and (amp_overflow_count == 1 or amp_overflow_count % 10 == 0):
                     logging.warning("AMP gradient overflow #%d at optimizer step %d; update skipped and scheduler held", amp_overflow_count, total_steps)
                 continue
             scheduler.step()
+            accumulated_microbatches = 0
 
             total_steps += 1
 
             if args.local_rank == 0:
-                logger.writer.add_scalar("train/live_loss", loss.item(), total_steps)
+                if total_steps % 10 == 0:
+                    logger.writer.add_scalar(
+                        "train/live_loss", loss.detach(), total_steps
+                    )
                 logger.writer.add_scalar(f'train/learning_rate', optimizer.param_groups[0]['lr'], total_steps)
                 logger.push(metrics)
 
@@ -492,7 +610,10 @@ def train(args):
                         logger.writer.add_image("gt_disp/{}".format(j),
                                                 (disp_gt[j]).data.type(torch.uint8), total_steps)
 
-                    results = validate_things(model_without_ddp, args.valid_iters, args.scale_iters, max_disp=args.eval_max_disp)
+                    results = validate_things(
+                        model_without_ddp, args.valid_iters, args.scale_iters,
+                        max_disp=args.eval_max_disp,
+                        binmono_metrics=args.model_arch in ('cor_ga_fast_binmono', 'cor_ga_fast_binmono_corrstats'))
                     logger.write_dict(results)
                     model.train()
                     if not args.distributed: model_without_ddp.freeze_bn()
@@ -501,6 +622,9 @@ def train(args):
                 should_keep_training = False
                 break
 
+        if accumulated_microbatches:
+            optimizer.zero_grad(set_to_none=True)
+            accumulated_microbatches = 0
         epoch += 1
 
         if len(train_loader) >= 10000:
@@ -519,7 +643,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='defom-stereo', help="name your experiment")
-    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins6'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga_fast_binmono_corrstats', 'cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_fast3', 'cor_ga_fast2', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins3_gwc', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_bins6', 'cor_ga_bins_residual'], help='model architecture')
 
     # resume pretrained model or resume training
     parser.add_argument('--resume_ckpt', default=None, type=str,
@@ -530,6 +654,8 @@ if __name__ == '__main__':
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                        help='microbatches accumulated per optimizer update')
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--train_folds', type=int, nargs='+', default=[1], help="training datasets' folds.")
@@ -543,6 +669,10 @@ if __name__ == '__main__':
     parser.add_argument('--amp_dtype', choices=['fp16', 'bf16'], default='fp16', help='autocast dtype used with --mixed_precision')
     parser.add_argument('--amp_init_scale', type=float, default=64.0, help='initial FP16 GradScaler scale; ignored without mixed precision and restored from full checkpoints')
     parser.add_argument('--debug_nan', action='store_true', help='enable targeted non-finite checks for NaN reproduction')
+    parser.add_argument('--skip_nonfinite_gradients', action='store_true',
+                        help='skip batches with non-finite gradients without stepping optimizer or scheduler')
+    parser.add_argument('--large_grad_warn_threshold', type=float, default=1e6,
+                        help='warn when the finite pre-clip gradient norm exceeds this value; set <= 0 to disable')
     parser.add_argument('--seed', default=1234565, type=int)
 
     # log
@@ -565,10 +695,18 @@ if __name__ == '__main__':
     # Raft Architecure choices
     parser.add_argument('--dinov2_encoder', type=str, default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--hypothesis_scales', type=float, nargs=3, default=[24.0, 48.0, 96.0],
-                        help='three quarter-resolution disparity scales; fixed constants for cor_ga_no_mono_head, otherwise applied to normalized monocular inverse depth')
+                        help='three quarter-resolution scales applied to normalized monocular inverse depth; ignored by bin-initialized models')
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='exclusive upper bound of bin offsets in each compressed right-feature coordinate')
     parser.add_argument('--init_corr_scale', type=float, default=10.0, help='scale applied to cosine matching logits')
+    parser.add_argument('--init_gwc_groups', type=int, default=8, help='channel groups used by cor_ga_bins3_gwc initialization')
+    parser.add_argument('--freeze_bininit_base', action='store_true', help='train only the new bin initializer/compressor in cor_ga_fast_bininit or cor_ga_no_mono_head')
+    parser.add_argument('--freeze_binmono_base', action='store_true', help='train only the shared bin/mono confidence head in cor_ga_fast_binmono')
+    parser.add_argument('--binmono_conf_hidden', type=int, default=32, help='hidden channels in the shared bin/mono confidence head')
+    parser.add_argument('--binmono_init_stereo_weight', type=float, default=0.05, help='initial stereo-bin weight used by cor_ga_fast_binmono')
+    parser.add_argument('--corr_stats_hidden', type=int, default=32, help='hidden channels in the refine correlation-statistics residual adapter')
+    parser.add_argument('--corr_stats_temperature', type=float, default=1.0, help='softmax temperature after local correlation standardization')
+    parser.add_argument('--init_gwc_hidden', type=int, default=32, help='hidden width of the shared per-bin GWC detector')
     parser.add_argument('--init_right_compression', choices=['avg', 'conv'], default='avg',
                         help='right-feature width compression used by cor_ga_bins bin matching')
     parser.add_argument('--refine_right_compression', choices=['avg', 'conv'], default='avg',
@@ -592,6 +730,8 @@ if __name__ == '__main__':
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
     parser.add_argument('--corr_levels', type=int, default=2, help="number of levels in the shared right-coordinate FullCorr pyramid")
     parser.add_argument('--corr_radius', type=int, default=4, help="shared local radius for FullCorr and right-feature window sampling")
+    parser.add_argument('--pair_feature_dim', type=int, default=8, help='candidate-pair token width used by cor_ga_fast_pairres')
+    parser.add_argument('--pair_residual_init_std', type=float, default=1e-4, help='small non-zero initialization std for the pair residual output projection')
 
     parser.add_argument('--n_downsample', type=int, default=2, choices=[2], help="fixed quarter-resolution disparity field")
     parser.add_argument('--context_norm', type=str, default="batch", choices=['group', 'batch', 'instance', 'none'], help="normalization of context encoder")

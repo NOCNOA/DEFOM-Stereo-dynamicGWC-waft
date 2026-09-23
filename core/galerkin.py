@@ -145,7 +145,11 @@ class simple_attn_rope_2d(nn.Module):
         freqs_y = torch.stack(freqs_y, dim=0)
         return torch.stack([freqs_x, freqs_y], dim=0)
 
-    def forward(self, x, name='0'):
+    def prepare_positions(self, x):
+        tx, ty = self.init_t_xy(end_x=x.shape[-1], end_y=x.shape[-2])
+        return self.compute_mixed_cis(self.freqs, tx.to(x.device), ty.to(x.device), self.heads)
+
+    def forward(self, x, name='0', freqs_cis=None):
         del name
         b, c, h, w = x.shape
         bias = x
@@ -154,10 +158,8 @@ class simple_attn_rope_2d(nn.Module):
         qkv = qkv.permute(0, 2, 1, 3)
         q, k, v = qkv.chunk(3, dim=-1)
 
-        t_x, t_y = self.init_t_xy(end_x=w, end_y=h)
-        t_x = t_x.to(x.device)
-        t_y = t_y.to(x.device)
-        freqs_cis = self.compute_mixed_cis(self.freqs, t_x, t_y, self.heads)
+        if freqs_cis is None:
+            freqs_cis = self.prepare_positions(x)
         q, k = self.apply_rotary_emb(q, k, freqs_cis=freqs_cis)
 
         k = self.kln(k)

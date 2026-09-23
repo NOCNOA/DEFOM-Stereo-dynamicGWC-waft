@@ -61,7 +61,9 @@ def sequence_loss(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700):
 
     return flow_loss, metrics
 
-def sequence_loss_d0L1(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700, smooth_l1_beta=1.0):
+def sequence_loss_d0L1(flow_preds, flow_gt, valid, loss_gamma=0.9,
+                       max_flow=700, smooth_l1_beta=1.0,
+                       debug_finite=False):
     """ 
     Loss function defined over sequence of flow predictions.
 
@@ -78,7 +80,10 @@ def sequence_loss_d0L1(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700,
 
     valid = ((valid >= 0.5) & (mag < max_flow))
     assert valid.shape == flow_gt.shape, [valid.shape, flow_gt.shape]
-    assert not torch.isinf(flow_gt[valid.bool()]).any()
+    if debug_finite:
+        assert not torch.isinf(flow_gt[valid.bool()]).any()
+    valid_float = valid.float()
+    valid_denominator = valid_float.sum().clamp_min(1.0)
 
     # same adjusted gamma logic as original RAFT-Stereo
     adjusted_loss_gamma = loss_gamma ** (15 / n_predictions)
@@ -86,7 +91,8 @@ def sequence_loss_d0L1(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700,
     for i in range(n_predictions):
         pred = flow_preds[i]
 
-        assert not torch.isnan(pred).any() and not torch.isinf(pred).any()
+        if debug_finite:
+            assert torch.isfinite(pred).all()
 
         i_weight = adjusted_loss_gamma ** (n_predictions - i)
 
@@ -106,17 +112,19 @@ def sequence_loss_d0L1(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700,
             i_loss.shape, valid.shape, flow_gt.shape, pred.shape
         ]
 
-        flow_loss += i_weight * i_loss[valid.bool()].mean()
+        flow_loss += (
+            i_weight * (i_loss * valid_float).sum() / valid_denominator
+        )
 
     # metrics keep unchanged, only evaluate final prediction
     epe = torch.sum((flow_preds[-1] - flow_gt) ** 2, dim=1).sqrt()
     epe = epe.view(-1)[valid.view(-1)]
 
     metrics = {
-        'epe': epe.mean().item(),
-        '1px': (epe < 1).float().mean().item(),
-        '3px': (epe < 3).float().mean().item(),
-        '5px': (epe < 5).float().mean().item(),
+        'epe': epe.mean().detach(),
+        '1px': (epe < 1).float().mean().detach(),
+        '3px': (epe < 3).float().mean().detach(),
+        '5px': (epe < 5).float().mean().detach(),
     }
 
     return flow_loss, metrics
@@ -147,6 +155,8 @@ def sequence_loss_multi_init_waft(
     gru_edge_lambda=1.0,
     use_gru_disp_grad_loss=False,
     gru_grad_lambda=0.02,
+    init_branch_loss_weight=None,
+    debug_finite=False,
 ):
     """WAFT initialization losses plus optional edge supervision on GRU outputs only.
 
@@ -184,9 +194,10 @@ def sequence_loss_multi_init_waft(
         raise ValueError(f"init_valid must match init_logits, got {tuple(init_valid.shape)} and {tuple(init_logits.shape)}")
     if tuple(hypothesis_logits.shape) != tuple(init_disps.shape):
         raise ValueError(f"hypothesis_logits must match init_disps, got {tuple(hypothesis_logits.shape)} and {tuple(init_disps.shape)}")
-    assert torch.isfinite(init_disps).all()
-    assert torch.isfinite(init_logits).all()
-    assert torch.isfinite(hypothesis_logits).all()
+    if debug_finite:
+        assert torch.isfinite(init_disps).all()
+        assert torch.isfinite(init_logits).all()
+        assert torch.isfinite(hypothesis_logits).all()
     num_bins = init_logits.shape[2]
     if tuple(init_bins.shape) != (num_ranges, num_bins):
         raise ValueError(f"init_bins must be {(num_ranges, num_bins)}, got {tuple(init_bins.shape)}")
@@ -211,10 +222,11 @@ def sequence_loss_multi_init_waft(
         target_probability = (target_probability / target_probability.sum(dim=1, keepdim=True).clamp_min(1e-6)).detach()
         prediction_logits = init_logits[:, branch_index].float().masked_fill(~candidate_valid, -1e4)
         classification_map = -(target_probability * F.log_softmax(prediction_logits, dim=1)).sum(dim=1, keepdim=True)
-        if branch_valid.any():
-            init_classification_losses.append(classification_map[branch_valid].mean())
-        else:
-            init_classification_losses.append(init_logits[:, branch_index].sum() * 0.0)
+        branch_valid_float = branch_valid.float()
+        init_classification_losses.append(
+            (classification_map * branch_valid_float).sum()
+            / branch_valid_float.sum().clamp_min(1.0)
+        )
         branch_eligible_masks.append(branch_valid)
     init_classification_loss = torch.stack(init_classification_losses).sum()
     branch_eligible = torch.cat(branch_eligible_masks, dim=1)
@@ -226,19 +238,24 @@ def sequence_loss_multi_init_waft(
     gate_probability = gate_log_probability.exp()
     gate_loss_map = -(gate_target_probability * gate_log_probability).sum(dim=1)
     gate_valid = branch_eligible.any(dim=1)
-    if gate_valid.any():
-        gate_loss = gate_loss_map[gate_valid].mean()
-        gate_accuracy = (gate_probability.argmax(dim=1)[gate_valid] == gate_target_probability.argmax(dim=1)[gate_valid]).float().mean().item()
-    else:
-        gate_loss = hypothesis_logits.sum() * 0.0
-        gate_accuracy = 0.0
+    gate_valid_float = gate_valid.float()
+    gate_denominator = gate_valid_float.sum().clamp_min(1.0)
+    gate_loss = (gate_loss_map * gate_valid_float).sum() / gate_denominator
+    gate_correct = (
+        gate_probability.argmax(dim=1)
+        == gate_target_probability.argmax(dim=1)
+    ).float()
+    gate_accuracy = (
+        (gate_correct * gate_valid_float).sum() / gate_denominator
+    ).detach()
     mag = torch.sum(flow_gt ** 2, dim=1, keepdim=True).sqrt()
     valid_full = (valid >= 0.5) & torch.isfinite(flow_gt) & (flow_gt >= 0.0) & (mag < float(max_flow))
     valid_float = valid_full.float()
     valid_den = valid_float.sum().clamp_min(1.0)
     flow_gt_safe = torch.where(valid_full, flow_gt, torch.zeros_like(flow_gt))
     d0_prediction = _as_disp_4d(flow_preds[0]).float()
-    assert torch.isfinite(d0_prediction).all()
+    if debug_finite:
+        assert torch.isfinite(d0_prediction).all()
     d0_loss_map = F.smooth_l1_loss(d0_prediction, flow_gt_safe, reduction='none', beta=float(smooth_l1_beta))
     d0_loss = (d0_loss_map * valid_float).sum() / valid_den
 
@@ -269,7 +286,8 @@ def sequence_loss_multi_init_waft(
     recurrent_loss_raw = flow_gt.new_tensor(0.0)
     for prediction_index, prediction in enumerate(recurrent_predictions):
         prediction = _as_disp_4d(prediction).float()
-        assert not torch.isnan(prediction).any() and not torch.isinf(prediction).any()
+        if debug_finite:
+            assert torch.isfinite(prediction).all()
         prediction_loss = (prediction - flow_gt_safe).abs()
         prediction_weight = adjusted_loss_gamma ** (num_recurrent_predictions - 1 - prediction_index)
         recurrent_weights.append(prediction_weight)
@@ -292,35 +310,35 @@ def sequence_loss_multi_init_waft(
     )
     epe = torch.sum((final_prediction - flow_gt_safe) ** 2, dim=1).sqrt().view(-1)[valid_full.view(-1)]
     if epe.numel() > 0:
-        epe_mean = epe.mean().item()
-        px1 = (epe < 1).float().mean().item()
-        px3 = (epe < 3).float().mean().item()
-        px5 = (epe < 5).float().mean().item()
+        epe_mean = epe.mean().detach()
+        px1 = (epe < 1).float().mean().detach()
+        px3 = (epe < 3).float().mean().detach()
+        px5 = (epe < 5).float().mean().detach()
     else:
-        epe_mean = px1 = px3 = px5 = 0.0
+        epe_mean = px1 = px3 = px5 = flow_gt.new_tensor(0.0)
     metrics = {
         'epe': epe_mean,
         '1px': px1,
         '3px': px3,
         '5px': px5,
-        'init_soft_ce': init_classification_loss.detach().item(),
-        'gate_soft_ce': gate_loss.detach().item(),
-        'gate_weighted_soft_ce': (float(gate_loss_weight) * gate_loss).detach().item(),
+        'init_soft_ce': init_classification_loss.detach(),
+        'gate_soft_ce': gate_loss.detach(),
+        'gate_weighted_soft_ce': (float(gate_loss_weight) * gate_loss).detach(),
         'gate_accuracy': gate_accuracy,
-        'd0_smooth_l1': d0_loss.detach().item(),
-        'd0_weighted_smooth_l1': (float(d0_loss_weight) * d0_loss).detach().item(),
-        'recurrent_l1': recurrent_loss.detach().item(),
-        'recurrent_l1_raw': recurrent_loss_raw.detach().item(),
-        'edge_pixel_ratio': edge_ratio.detach().item(),
-        'edge_weighted_mass_ratio': edge_weighted_mass_ratio.detach().item(),
-        'gru_disp_grad_loss': gru_disp_grad_loss.detach().item(),
-        'gru_weighted_disp_grad_loss': weighted_gru_disp_grad_loss.detach().item(),
+        'd0_smooth_l1': d0_loss.detach(),
+        'd0_weighted_smooth_l1': (float(d0_loss_weight) * d0_loss).detach(),
+        'recurrent_l1': recurrent_loss.detach(),
+        'recurrent_l1_raw': recurrent_loss_raw.detach(),
+        'edge_pixel_ratio': edge_ratio.detach(),
+        'edge_weighted_mass_ratio': edge_weighted_mass_ratio.detach(),
+        'gru_disp_grad_loss': gru_disp_grad_loss.detach(),
+        'gru_weighted_disp_grad_loss': weighted_gru_disp_grad_loss.detach(),
         'recurrent_weight_first': recurrent_weights[0] if recurrent_weights else 0.0,
         'recurrent_weight_last': recurrent_weights[-1] if recurrent_weights else 0.0,
-        'total_loss': total_loss.detach().item(),
+        'total_loss': total_loss.detach(),
     }
     for branch_index, branch_loss in enumerate(init_classification_losses):
-        metrics[f'init_soft_ce_{branch_index}'] = branch_loss.detach().item()
+        metrics[f'init_soft_ce_{branch_index}'] = branch_loss.detach()
     return total_loss, metrics
 
 
@@ -760,8 +778,11 @@ def sequence_loss_smoothness(
 
 def fetch_optimizer(args, model, last_epoch=-1, checkpoint=None):
     """ Create the optimizer and learning rate scheduler """
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+    trainable_params = [parameter for parameter in model.parameters()
+                        if parameter.requires_grad]
+    optimizer = optim.AdamW(
+        trainable_params, lr=args.lr, weight_decay=args.wdecay, eps=1e-8,
+    )
     if checkpoint is not None:
         optimizer.load_state_dict(checkpoint['optimizer'])
 

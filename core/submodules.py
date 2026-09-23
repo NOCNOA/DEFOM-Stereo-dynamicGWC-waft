@@ -1233,7 +1233,17 @@ def sample_lowres_gwc_volume(
     return sampled, valid
 
 
-def lookup_right_features(fmap1_low, right_feature_pyramid, disp, warp_offsets, feature_fuse, rope_galerkin=None, scale_weights=None, compression_ratios=(1, 2, 4)):
+def lookup_right_features(
+    fmap1_low,
+    right_feature_pyramid,
+    disp,
+    warp_offsets,
+    feature_fuse,
+    rope_galerkin=None,
+    scale_weights=None,
+    compression_ratios=(1, 2, 4),
+    compact_sampling=False,
+):
     """Sample and fuse local right-feature windows at the current disparity.
 
     Grid sampling stays in FP32 inside sample_right_feature_pyramid. The
@@ -1245,7 +1255,15 @@ def lookup_right_features(fmap1_low, right_feature_pyramid, disp, warp_offsets, 
     if len(right_feature_pyramid) != len(compression_ratios):
         raise ValueError("right_feature_pyramid and compression_ratios must have equal length")
 
-    sampled_right = sample_right_feature_pyramid(right_feature_pyramid, disp, offsets=warp_offsets.flatten(), compression_ratios=compression_ratios, padding_mode='zeros', align_corners=True)
+    sampled_right = sample_right_feature_pyramid(
+        right_feature_pyramid,
+        disp,
+        offsets=warp_offsets.flatten(),
+        compression_ratios=compression_ratios,
+        padding_mode='zeros',
+        align_corners=True,
+        compact=compact_sampling,
+    )
     batch, channels, height, width = fmap1_low.shape
     num_scales = len(compression_ratios)
     num_samples = sampled_right.shape[1]

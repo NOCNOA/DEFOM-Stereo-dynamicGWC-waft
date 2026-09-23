@@ -482,11 +482,13 @@ class MultiBasicEncoder(nn.Module):
 
 
 class DefomEncoder(nn.Module):
-    def __init__(self, dinov2_encoder, pretrained=True, freeze=True):
+    def __init__(self, dinov2_encoder, pretrained=True, freeze=True,
+                 use_mono_head=True):
         super(DefomEncoder, self).__init__()
         self.dinov2_encoder = dinov2_encoder
         self.pretrained = pretrained
         self.freeze = freeze
+        self.use_mono_head = use_mono_head
 
         model_configs = {
             'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -495,7 +497,10 @@ class DefomEncoder(nn.Module):
             'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
         }
 
-        self.depth_anything = DepthAnythingV2(**model_configs[self.dinov2_encoder])
+        self.depth_anything = DepthAnythingV2(
+            **model_configs[self.dinov2_encoder],
+            build_depth_head=use_mono_head,
+        )
 
         if pretrained and os.path.exists(f'./checkpoints/depth_anything_v2_{dinov2_encoder}.pth'):
             self.depth_anything.load_state_dict(
@@ -503,8 +508,9 @@ class DefomEncoder(nn.Module):
         if freeze:
             for param in self.depth_anything.pretrained.parameters():
                 param.requires_grad = False
-            for param in self.depth_anything.depth_head.parameters():
-                param.requires_grad = False
+            if self.depth_anything.depth_head is not None:
+                for param in self.depth_anything.depth_head.parameters():
+                    param.requires_grad = False
         
         self.out_dim = model_configs[self.dinov2_encoder]['features']
 
@@ -517,13 +523,27 @@ class DefomEncoder(nn.Module):
         stereo_images = F.interpolate(stereo_images, (ih, iw), mode="bilinear", align_corners=True)
 
         left_feat, right_feat, left_idepth = self.depth_anything(stereo_images, oh, ow)
+        expected_size = (oh, ow)
+        if not self.use_mono_head:
+            for name, tensor in (
+                ("left feature", left_feat),
+                ("right feature", right_feat),
+            ):
+                if tensor.shape[-2:] != expected_size:
+                    raise RuntimeError(
+                        f"{name} must be 1/4 resolution {expected_size}, "
+                        f"got {tensor.shape[-2:]}"
+                    )
+            return left_feat, right_feat, None
+
+        if left_idepth is None:
+            raise RuntimeError("The monocular depth head did not return inverse depth")
         batch_size = left_idepth.shape[0]
         left_idepth = left_idepth.float()
         max_idepth = left_idepth.reshape(batch_size, -1).amax(dim=1, keepdim=True).detach()
         max_idepth = max_idepth.reshape(batch_size, 1, 1, 1).clamp_min(1e-8)
         mono_idepth1_4 = left_idepth / max_idepth
 
-        expected_size = (oh, ow)
         outputs = (
             ("left feature", left_feat),
             ("right feature", right_feat),
@@ -534,6 +554,3 @@ class DefomEncoder(nn.Module):
                 raise RuntimeError(f"{name} must be 1/4 resolution {expected_size}, got {tensor.shape[-2:]}")
 
         return left_feat, right_feat, mono_idepth1_4.contiguous()
-
-
-

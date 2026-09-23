@@ -107,7 +107,15 @@ def disp_warp_multi(img, disp_samples, padding_mode='border', align_corners=True
     return warped.view(b, s, c, h, w)
 
 
-def sample_right_feature_pyramid(right_features, disp, offsets, compression_ratios=(1, 2, 4), padding_mode='zeros', align_corners=True):
+def sample_right_feature_pyramid(
+    right_features,
+    disp,
+    offsets,
+    compression_ratios=(1, 2, 4),
+    padding_mode='zeros',
+    align_corners=True,
+    compact=False,
+):
     """Sample right features around the current left-view disparity.
 
     Args:
@@ -165,19 +173,46 @@ def sample_right_feature_pyramid(right_features, disp, offsets, compression_rati
             y_norm = 2.0 * (y_right + 0.5) / source_height - 1.0
 
         sample_count = offsets.numel()
-        grid = torch.stack([x_norm, y_norm], dim=-1).reshape(batch * sample_count, query_height, query_width, 2)
         channels = right_feat.shape[1]
-        expanded_right = right_feat.unsqueeze(1).expand(batch, sample_count, channels, source_height, source_width)
-        expanded_right = expanded_right.reshape(batch * sample_count, channels, source_height, source_width)
-
+        grid = torch.stack([x_norm, y_norm], dim=-1)
         with torch.cuda.amp.autocast(enabled=False):
-            sampled = F.grid_sample(
-                expanded_right.float(),
-                grid.float(),
-                mode='bilinear',
-                padding_mode=padding_mode,
-                align_corners=align_corners,
-            )
-        sampled_scales.append(sampled.to(right_feat.dtype).reshape(batch, sample_count, channels, query_height, query_width))
+            if compact:
+                # Treat the offset dimension as additional output rows. This
+                # samples the same coordinates without materializing K copies
+                # of the complete right feature tensor.
+                compact_grid = grid.reshape(
+                    batch, sample_count * query_height, query_width, 2
+                )
+                sampled = F.grid_sample(
+                    right_feat.float(),
+                    compact_grid.float(),
+                    mode='bilinear',
+                    padding_mode=padding_mode,
+                    align_corners=align_corners,
+                )
+                sampled = sampled.reshape(
+                    batch, channels, sample_count, query_height, query_width
+                ).permute(0, 2, 1, 3, 4)
+            else:
+                grid = grid.reshape(
+                    batch * sample_count, query_height, query_width, 2
+                )
+                expanded_right = right_feat.unsqueeze(1).expand(
+                    batch, sample_count, channels, source_height, source_width
+                )
+                expanded_right = expanded_right.reshape(
+                    batch * sample_count, channels, source_height, source_width
+                )
+                sampled = F.grid_sample(
+                    expanded_right.float(),
+                    grid.float(),
+                    mode='bilinear',
+                    padding_mode=padding_mode,
+                    align_corners=align_corners,
+                )
+                sampled = sampled.reshape(
+                    batch, sample_count, channels, query_height, query_width
+                )
+        sampled_scales.append(sampled.to(right_feat.dtype))
 
     return torch.cat(sampled_scales, dim=1) #batch, sample_count*level, channels, query_height, query_width

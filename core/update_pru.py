@@ -200,11 +200,24 @@ class MultiPromptUpdateBlock(nn.Module):
             ) for i in range(self.num_layers)
         ])
 
-    def forward(self, net, corr, disp, ctx, warp_feat, mono_disp):
-        norm_mono, _, _ = normalize_disparity(mono_disp)
+    def prepare_static(self, ctx, mono_disp):
+        """Per-forward cache with autograd retained."""
+        enc = self.structure_encoder
+        c = F.relu(enc.convc1(ctx.float()), True)
+        return F.relu(enc.convc2(c), True), normalize_disparity(mono_disp)[0]
+
+    def forward(self, net, corr, disp, ctx, warp_feat, mono_disp,
+                static_features=None, need_mask=True):
+        norm_mono = normalize_disparity(mono_disp)[0] if static_features is None else static_features[1]
         norm_disp, _, _ = normalize_disparity(disp)
         norm_res = norm_mono - norm_disp
-        structure = self.structure_encoder(ctx, norm_res)
+        if static_features is None:
+            structure = self.structure_encoder(ctx, norm_res)
+        else:
+            enc = self.structure_encoder
+            d = F.relu(enc.convd1(norm_res), True)
+            d = F.relu(enc.convd2(d), True)
+            structure = F.relu(enc.conv(torch.cat([static_features[0], d], dim=1)), True)
         motion = self.motion_encoder(corr, disp, warp_feat)
 
         if len(net) != self.num_layers:
@@ -215,7 +228,7 @@ class MultiPromptUpdateBlock(nn.Module):
             pru_out = self.stereo_pru[0](net[0], structure=structure, motion=motion)
             net[0] = (1 - z) * net[0] + z * pru_out
             delta_disp = self.disp_head(net[0])
-            mask = .25 * self.mask(net[0])
+            mask = .25 * self.mask(net[0]) if need_mask else None
             return net, delta_disp, mask
 
         for i in reversed(range(len(net))):
@@ -237,7 +250,7 @@ class MultiPromptUpdateBlock(nn.Module):
                 net[i] = (1 - z) * net[i] + z * pru_out
 
         delta_disp = self.disp_head(net[0])
-        mask = .25 * self.mask(net[0])
+        mask = .25 * self.mask(net[0]) if need_mask else None
 
         return net, delta_disp, mask
 

@@ -2,11 +2,21 @@
 set -euo pipefail
 
 MODE="${1:-fresh}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-defomstereo_pure_stereo_corga_s48_96_128}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-defomstereo_vitl_corga_no_mono_igev}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints/${EXPERIMENT_NAME}}"
 LATEST_CKPT="${CHECKPOINT_DIR}/checkpoint_latest.pth"
 GPU_ID="${GPU_ID:-0}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/u2025140689/anaconda3/envs/defomstereo2/bin/python}"
+DEBUG_NAN="${DEBUG_NAN:-0}"
+
+case "${DEBUG_NAN}" in
+    0) DEBUG_ARGS=() ;;
+    1) DEBUG_ARGS=(--debug_nan) ;;
+    *)
+        echo "DEBUG_NAN must be 0 or 1, got '${DEBUG_NAN}'." >&2
+        exit 2
+        ;;
+esac
 
 case "${MODE}" in
     fresh)
@@ -34,22 +44,26 @@ mkdir -p "${CHECKPOINT_DIR}"
 echo "mode=${MODE} experiment=${EXPERIMENT_NAME} gpu=${GPU_ID}"
 
 CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" train_stereo.py \
---model_arch cor_ga_no_mono_head \
+--model_arch cor_ga_no_mono_igev \
+--dinov2_encoder vitl \
 --launcher none \
 --gpu_ids 0 \
 --name "${EXPERIMENT_NAME}" \
 --batch_size 2 \
---num_workers 2 \
+--num_workers 4 \
 --train_datasets sceneflow \
 --train_folds 1 \
 --num_steps 200000 \
 --save_ckpt_freq 20000 \
---save_latest_ckpt_freq 1000 \
+--save_latest_ckpt_freq 5000 \
 --n_downsample 2 \
 --train_iters 18 \
 --scale_iters 6 \
---hypothesis_scales 48 96 128 \
 --coarse_loss_weight 0.2 \
+--num_init_bins 48 \
+--init_max_offset 48 \
+--init_corr_scale 10 \
+--init_right_compression avg \
 --loss_gamma 0.9 \
 --smooth_l1_beta 1.0 \
 --max_delta_disp 8.0 \
@@ -67,7 +81,7 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" train_stereo.py \
 --valid_iters 32 \
 --amp_dtype bf16 \
 "${RESUME_ARGS[@]}" \
+"${DEBUG_ARGS[@]}" \
 --mixed_precision \
---debug_nan \
 --lr 0.00020 \
 2>&1 | tee -a "${CHECKPOINT_DIR}/train.log"

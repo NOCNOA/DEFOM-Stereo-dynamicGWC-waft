@@ -266,6 +266,7 @@ class DepthAnythingV2(nn.Module):
         out_channels=[256, 512, 1024, 1024], 
         use_bn=False, 
         use_clstoken=False,
+        build_depth_head=True,
     ):
         super(DepthAnythingV2, self).__init__()
         
@@ -278,8 +279,11 @@ class DepthAnythingV2(nn.Module):
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
         
-        self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn,
-                                  out_channels=out_channels, use_clstoken=use_clstoken)
+        self.depth_head = (
+            DPTHead(self.pretrained.embed_dim, features, use_bn,
+                    out_channels=out_channels, use_clstoken=use_clstoken)
+            if build_depth_head else None
+        )
         self.depth_feat = DPTFeat(self.pretrained.embed_dim, features, use_bn,
                                   out_channels=out_channels, use_clstoken=use_clstoken)
     
@@ -297,8 +301,13 @@ class DepthAnythingV2(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
 
         left_feat, right_feat = self.depth_feat(features, patch_h, patch_w, out_h, out_w)
-        pair_batch = x.shape[0] // 2
-        left_idepth = self.depth_head(self._left_features(features, pair_batch), patch_h, patch_w, out_h, out_w)
+        left_idepth = None
+        if self.depth_head is not None:
+            pair_batch = x.shape[0] // 2
+            left_idepth = self.depth_head(
+                self._left_features(features, pair_batch),
+                patch_h, patch_w, out_h, out_w,
+            )
 
         return left_feat, right_feat, left_idepth
                
