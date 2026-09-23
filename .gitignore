@@ -29,6 +29,7 @@ checkpoints/
 *.bin
 *.onnx
 *.safetensors
+*.orig
 
 # Training / inference outputs
 output/
