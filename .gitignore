@@ -20,7 +20,7 @@ nohup.out
 nohup*.out
 nohups/
 *.md 
-
+*.txt
 # Model weights / checkpoints
 checkpoints/
 *.pth

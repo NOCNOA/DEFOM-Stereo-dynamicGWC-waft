@@ -2,7 +2,7 @@ import argparse
 
 import torch
 
-from core.defom_cor_ga import DEFOMStereo
+from core.corga.defom_cor_ga import DEFOMStereo
 
 
 def tensor_stats(name, tensor):

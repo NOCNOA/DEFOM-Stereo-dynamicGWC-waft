@@ -165,6 +165,45 @@ The pretrained models are available on [Google Drive](https://drive.google.com/d
 bash scripts/evaluate.sh
 ```
 
+### Mixed validation
+
+Run all seven sources with `--datasets mixed`. Set `--mixed_root NAME=PATH` for
+each dataset whose files are not at the loader's default path. UnrealStereo4K
+always needs a root and defaults to scene `00008` (the out-of-domain test scene).
+Its expected layout is `ROOT/00008/{Image0,Image1,Disp0}/`, with matching image
+names and `Disp0/*.npy` disparity files. Both original PNG images and the
+quarter-resolution JPG images are accepted.
+
+```bash
+python evaluate_stereo.py --restore_ckpt checkpoints/model.pth \
+  --model_arch cor_ga --datasets mixed \
+  --mixed_root sceneflow=/data/SceneFlow \
+  --mixed_root middlebury_H=/data/Middlebury \
+  --mixed_root unrealstereo4k=/data/UnrealStereo4K \
+  --mixed_root sintel_stereo=/data/SintelStereo \
+  --mixed_root crestereo=/data/CreStereo \
+  --mixed_root tartan_air=/data/TartanAir \
+  --mixed_root vkitti2=/data/VKITTI2
+```
+
+If VKITTI2 RGB and depth files live under different roots, also pass
+`--mixed_root vkitti2_depth=/path/to/depth`.
+
+The names are `sceneflow`, `middlebury_H`, `unrealstereo4k`, `sintel_stereo`,
+`crestereo`, `tartan_air`, and `vkitti2`. SceneFlow uses FlyingThings3D TEST;
+Middlebury H uses the existing official training-scene list; UnrealStereo4K
+uses scene `00008`. By default, validation deterministically selects 100 images
+spread uniformly over each ordered dataset; a dataset with fewer than 100 images
+uses all of them. For Sintel, CREStereo, TartanAir, and VKITTI2, pass a
+`--mixed_manifest NAME=FILE` to evaluate a fixed held-out subset. Each manifest
+contains one absolute left-image path per line. Without a manifest, all files
+found by that loader are candidates for the uniform selection.
+`--mixed_max_samples N` changes the per-source cap.
+
+The output includes EPE and Out3 for each source, the equal-weight mean of
+the seven source metrics (`macro`), and a valid-pixel-weighted mean. Pixels
+must have finite prediction and GT disparity with `0 < GT < --max_disp`.
+
 # Make Benchmark Submission
 
 ```
@@ -186,6 +225,32 @@ bash scripts/download_dav2.sh
 bash scripts/train_sceneflow_vits.sh
 bash scripts/train_sceneflow_vitl.sh
 ```
+
+CorGA and bin experiments are grouped by model family:
+
+| Family | Models | Scripts | nohup logs |
+| --- | --- | --- | --- |
+| CorGA | `core/corga/` | `scripts/corga/` | `nohups/corga/` |
+| Bin | `core/bin/` | `scripts/bin/` | `nohups/bin/` |
+
+`fast_bininit` and `fast_binmono` remain in CorGA because they extend the
+CorGA-fast architecture; `defom_cor_ga_bins*` models form the bin series.
+Older GWC-only logs are in `nohups/other/`. Shared model components and
+general-purpose scripts remain in `core/` and `scripts/`.
+
+For example, launch the IGEV++ CorGA experiment from the repository root with:
+
+```bash
+EXPERIMENT_NAME=defomstereo_corga_igevpp_encoder_new \
+  nohup setsid bash scripts/corga/train_sceneflow_corga_igevpp_encoder.sh fresh \
+  >> nohups/corga/corga_igevpp_encoder_new.out 2>&1 < /dev/null &
+```
+
+The IGEV++ script defaults to `GPU_ID=0,2` and launches one DDP process per
+visible GPU. `GLOBAL_BATCH_SIZE=4` is the default global batch size (2 images
+per GPU with two GPUs). Set `GPU_ID=0,1,2,3 GLOBAL_BATCH_SIZE=8` to use four
+local GPUs with the same per-GPU batch size. A single GPU uses the ordinary
+Python training path.
 
 ### Finetune for Benchmarks
 

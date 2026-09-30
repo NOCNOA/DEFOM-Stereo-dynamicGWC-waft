@@ -710,7 +710,7 @@ class StereoDataset(data.Dataset):
         img1 = torch.from_numpy(img1.copy()).permute(2, 0, 1).float()
         img2 = torch.from_numpy(img2.copy()).permute(2, 0, 1).float()
         disp = torch.from_numpy(disp[..., np.newaxis].copy()).permute(2, 0, 1).float()
-        if self.sparse:
+        if self.sparse or self.is_eval:
             valid = torch.from_numpy(valid[..., np.newaxis].astype(np.bool_).copy()).permute(2, 0, 1)
         else:
             valid = disp < 768
@@ -1026,14 +1026,14 @@ class ThreeDKenBurns(StereoDataset):
 
 
 class VKITTI2(StereoDataset):
-    def __init__(self, aug_params=None, root='/data2/yijiayi_data/vkitti/unzip_202603031214_vkitti_2'):
+    def __init__(self, aug_params=None, root='/data2/yijiayi_data/vkitti/unzip_202603031214_vkitti_2', depth_root=None):
         super().__init__(aug_params, reader=frame_utils.readDispVKITTI2)
         #/data2/yijiayi_data/vkitti/unzip_202603031214_vkitti_2/Scene02/15-deg-left/frames/rgb/Camera_0/rgb_00000.jpg
         image1_list = sorted(glob(osp.join(root, 'Scene*/*/frames/rgb/Camera_0/rgb_*.jpg')))
         image2_list = sorted(glob(osp.join(root, 'Scene*/*/frames/rgb/Camera_1/rgb_*.jpg')))
-        root = '/data2/yijiayi_data/vkitti/unzip_202603031236_vkitti_2'
-        disp1_list = sorted(glob(osp.join(root, 'Scene*/*/frames/depth/Camera_0/depth_*.png')))
-        disp2_list = sorted(glob(osp.join(root, 'Scene*/*/frames/depth/Camera_1/depth_*.png')))
+        depth_root = depth_root or '/data2/yijiayi_data/vkitti/unzip_202603031236_vkitti_2'
+        disp1_list = sorted(glob(osp.join(depth_root, 'Scene*/*/frames/depth/Camera_0/depth_*.png')))
+        disp2_list = sorted(glob(osp.join(depth_root, 'Scene*/*/frames/depth/Camera_1/depth_*.png')))
 
         for img1, img2, disp1, disp2 in zip(image1_list, image2_list, disp1_list, disp2_list):
             self.image_list += [[img1, img2]]
@@ -1172,4 +1172,3 @@ def fetch_dataset(args):
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_dataset
-

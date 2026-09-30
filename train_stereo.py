@@ -4,6 +4,7 @@ import sys
 import gc
 import logging
 import argparse
+from datetime import timedelta
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -15,31 +16,32 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from utils.dist_utils import get_dist_info, init_dist, setup_for_distributed
 from utils.utils import *
-from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
-from core.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitEdgeStereo
-from core.defom_cor_ga_bins3_gwc import DEFOMStereo as CorGABins3GWCStereo
-from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
-from core.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
-from core.defom_cor_ga_bins5_shared_parallel import DEFOMStereo as CorGABins5SharedParallelStereo
-from core.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
-from core.defom_cor_ga_bins_residual import DEFOMStereo as CorGABinsResidualStereo
-from core.defom_cor_ga import DEFOMStereo as CorGAStereo
-from core.defom_cor_ga_coarse1 import DEFOMStereo as CorGACoarse1Stereo
-from core.defom_cor_ga_lite import DEFOMStereo as CorGALiteStereo
-from core.defom_cor_ga_fast import DEFOMStereo as CorGAFastStereo
-from core.defom_cor_ga_fast2 import DEFOMStereo as CorGAFast2Stereo
-from core.defom_cor_ga_fast3 import DEFOMStereo as CorGAFast3Stereo
-from core.defom_cor_ga_no_mono_head import DEFOMStereo as CorGANoMonoHeadStereo
-from core.defom_cor_ga_no_mono_igev import DEFOMStereo as CorGANoMonoIGEVStereo
-from core.defom_cor_ga_stereo_igev import DEFOMStereo as CorGAStereoIGEVStereo
-from core.defom_cor_ga_fast_pairres import DEFOMStereo as CorGAFastPairResidualStereo
-from core.defom_cor_ga_fast_bininit import DEFOMStereo as CorGAFastBinInitStereo
-from core.defom_cor_ga_fast_binmono import DEFOMStereo as CorGAFastBinMonoStereo
-from core.defom_cor_ga_fast_binmono_corrstats import DEFOMStereo as CorGAFastBinMonoCorrStatsStereo
-from core.defom_cor_ga_noh import DEFOMStereo as CorGANoHiddenStereo
-from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
+from core.bin.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
+from core.bin.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitEdgeStereo
+from core.bin.defom_cor_ga_bins3_gwc import DEFOMStereo as CorGABins3GWCStereo
+from core.bin.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
+from core.bin.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
+from core.bin.defom_cor_ga_bins5_shared_parallel import DEFOMStereo as CorGABins5SharedParallelStereo
+from core.bin.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
+from core.bin.defom_cor_ga_bins_residual import DEFOMStereo as CorGABinsResidualStereo
+from core.corga.defom_cor_ga import DEFOMStereo as CorGAStereo
+from core.corga.defom_cor_ga_coarse1 import DEFOMStereo as CorGACoarse1Stereo
+from core.corga.defom_cor_ga_lite import DEFOMStereo as CorGALiteStereo
+from core.corga.defom_cor_ga_fast import DEFOMStereo as CorGAFastStereo
+from core.corga.defom_cor_ga_fast2 import DEFOMStereo as CorGAFast2Stereo
+from core.corga.defom_cor_ga_fast3 import DEFOMStereo as CorGAFast3Stereo
+from core.corga.defom_cor_ga_no_mono_head import DEFOMStereo as CorGANoMonoHeadStereo
+from core.corga.defom_cor_ga_no_mono_igev import DEFOMStereo as CorGANoMonoIGEVStereo
+from core.corga.defom_cor_ga_stereo_igev import DEFOMStereo as CorGAStereoIGEVStereo
+from core.corga.defom_cor_ga_stereo_igevpp_encoder import DEFOMStereo as CorGAStereoIGEVPPEncoderStereo
+from core.corga.defom_cor_ga_stereo_igevpp_encoder_coarse_corr_only import DEFOMStereo as CorGAStereoIGEVPPEncoderCoarseCorrOnlyStereo
+from core.corga.defom_cor_ga_fast_pairres import DEFOMStereo as CorGAFastPairResidualStereo
+from core.corga.defom_cor_ga_fast_bininit import DEFOMStereo as CorGAFastBinInitStereo
+from core.corga.defom_cor_ga_fast_binmono import DEFOMStereo as CorGAFastBinMonoStereo
+from core.corga.defom_cor_ga_fast_binmono_corrstats import DEFOMStereo as CorGAFastBinMonoCorrStatsStereo
+from core.corga.defom_cor_ga_noh import DEFOMStereo as CorGANoHiddenStereo
+from core.bin.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
 #from core.defom_GRU_2multi import DEFOMStereo
 #from core.defom_onlygwc import DEFOMStereo
 #from core.defom_pru import DEFOMStereo
@@ -155,7 +157,58 @@ def train(args):
     seed_everything(args.seed)
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.resume_batch_skip < 0 or (args.resume_batch_skip and not args.resume_ckpt):
+        raise ValueError("resume_batch_skip must be non-negative and requires --resume_ckpt")
+    if args.resume_lr_scale <= 0:
+        raise ValueError("resume_lr_scale must be positive")
+    if args.stop_after_step < 0 or (args.stop_after_step and args.stop_after_step > args.num_steps):
+        raise ValueError("stop_after_step must be between 0 and num_steps")
+    if args.freeze_stereo_encoder and (
+        args.model_arch != 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'
+        or not args.resume_ckpt
+    ):
+        raise ValueError(
+            "--freeze_stereo_encoder requires the coarse-corr-only model "
+            "and a full resume checkpoint"
+        )
+    if args.freeze_coarse_gru_motion and (
+        args.model_arch != 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'
+        or not args.resume_ckpt
+    ):
+        raise ValueError(
+            "--freeze_coarse_gru_motion requires the coarse-corr-only model "
+            "and a full resume checkpoint"
+        )
+    if (
+        args.freeze_refine_update_projection
+        or args.freeze_refine_update
+        or args.freeze_refine_projection
+        or args.freeze_refine_component
+    ) and (
+        args.model_arch != 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'
+        or not args.resume_ckpt
+    ):
+        raise ValueError(
+            "Refine freeze options require the coarse-corr-only model "
+            "and a full resume checkpoint"
+        )
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    args.distributed = world_size > 1
+    args.local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
+    if args.distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError('Multi-GPU training requires CUDA')
+        if args.local_rank >= torch.cuda.device_count():
+            raise ValueError(f'LOCAL_RANK={args.local_rank} exceeds the visible GPU count')
+        torch.cuda.set_device(args.local_rank)
+        torch.distributed.init_process_group(
+            backend='nccl', init_method='env://', timeout=timedelta(hours=2)
+        )
+        device = torch.device('cuda', args.local_rank)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    rank = torch.distributed.get_rank() if args.distributed else 0
+    is_main_process = rank == 0
     # if args.train_max_disp <= 0 or args.eval_max_disp <= 0:
     #     raise ValueError(f"train_max_disp and eval_max_disp must be positive, got {args.train_max_disp} and {args.eval_max_disp}")
     # if args.d0_loss_weight < 0 or args.gate_loss_weight < 0:
@@ -172,24 +225,14 @@ def train(args):
     # if args.edge_threshold < 0 or args.edge_dilation < 1:
     #     raise ValueError(f"edge_threshold must be non-negative and edge_dilation positive, got {args.edge_threshold} and {args.edge_dilation}")
 
-    # if args.launcher == 'none':
-    #     args.distributed = False
-    #     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # else:
-    #     args.distributed = True
-
-    #     # adjust batch size for each gpu
-    #     assert args.batch_size % torch.cuda.device_count() == 0
-    #     args.batch_size = args.batch_size // torch.cuda.device_count()
-
-    #     dist_params = dict(backend='nccl')
-    #     init_dist(args.launcher, **dist_params)
-    #     # re-set gpu_ids with distributed training mode
-    #     _, world_size = get_dist_info()
-    #     args.gpu_ids = range(world_size)
-    #     device = torch.device('cuda:{}'.format(args.local_rank))
-
-    #     setup_for_distributed(args.local_rank == 0)
+    if args.distributed:
+        if args.batch_size < world_size or args.batch_size % world_size:
+            raise ValueError(
+                f'Global batch_size={args.batch_size} must be divisible by WORLD_SIZE={world_size}'
+            )
+        args.batch_size //= world_size
+        if is_main_process:
+            logging.info('DDP: %d GPUs, %d samples per GPU', world_size, args.batch_size)
 
     model_classes = {
         'cor_ga_coarse1': CorGACoarse1Stereo,
@@ -201,6 +244,8 @@ def train(args):
         'cor_ga_no_mono_head': CorGANoMonoHeadStereo,
         'cor_ga_no_mono_igev': CorGANoMonoIGEVStereo,
         'cor_ga_stereo_igev': CorGAStereoIGEVStereo,
+        'cor_ga_stereo_igevpp_encoder': CorGAStereoIGEVPPEncoderStereo,
+        'cor_ga_stereo_igevpp_encoder_coarse_corr_only': CorGAStereoIGEVPPEncoderCoarseCorrOnlyStereo,
         'cor_ga_fast_pairres': CorGAFastPairResidualStereo,
         'cor_ga_fast_bininit': CorGAFastBinInitStereo,
         'cor_ga_fast_binmono': CorGAFastBinMonoStereo,
@@ -218,16 +263,39 @@ def train(args):
     }
     model_class = model_classes[args.model_arch]
     model = model_class(args).to(device)
+    if args.freeze_stereo_encoder:
+        for parameter in model.stereo_encoder.parameters():
+            parameter.requires_grad_(False)
+        if is_main_process:
+            logging.info('Frozen stereo_encoder for the resumed control experiment')
+    if args.freeze_coarse_gru_motion:
+        for block in model.coarse_update_blocks:
+            block.gru_layers.requires_grad_(False)
+            block.motion_encoder.requires_grad_(False)
+        if is_main_process:
+            logging.info('Frozen coarse GRU layers and motion encoders for the resumed control experiment')
+    if args.freeze_refine_update_projection or args.freeze_refine_update:
+        model.refine_update_block.requires_grad_(False)
+        if is_main_process:
+            logging.info('Frozen refine update block for the resumed control experiment')
+    if args.freeze_refine_update_projection or args.freeze_refine_projection:
+        model.refine_state_projections.requires_grad_(False)
+        if is_main_process:
+            logging.info('Frozen refine state projections for the resumed control experiment')
+    if args.freeze_refine_component:
+        component = getattr(model.refine_update_block, args.freeze_refine_component)
+        component.requires_grad_(False)
+        if is_main_process:
+            logging.info('Frozen refine update component %s for the resumed control experiment', args.freeze_refine_component)
     print("Parameter Count: %d, Trainable: %d" % count_parameters(model))
 
     if args.distributed:
-        process_group = torch.distributed.new_group(list(range(len(args.gpu_ids))))
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group)
         model = torch.nn.parallel.DistributedDataParallel(
-            model.to(device),
+            model,
             device_ids=[args.local_rank],
             output_device=args.local_rank,
-            find_unused_parameters=True)
+            broadcast_buffers=False,
+            find_unused_parameters=args.model_arch not in ('cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'))
         model_without_ddp = model.module
     else:
         if torch.cuda.device_count() > 1:
@@ -275,6 +343,15 @@ def train(args):
                     param_group['lr'] = restored_lr
             else:
                 logging.warning("Checkpoint has no scheduler state; reconstructing it from step %d", start_step)
+            if args.resume_lr_scale != 1.0:
+                for param_group in optimizer.param_groups:
+                    for key in ('lr', 'initial_lr', 'max_lr', 'min_lr'):
+                        if key in param_group:
+                            param_group[key] *= args.resume_lr_scale
+                scheduler.base_lrs = [lr * args.resume_lr_scale for lr in scheduler.base_lrs]
+                scheduler._last_lr = [lr * args.resume_lr_scale for lr in scheduler.get_last_lr()]
+                logging.info("Scaled resumed learning-rate schedule by %.4f; current LR %.8f",
+                             args.resume_lr_scale, optimizer.param_groups[0]['lr'])
             if scaler.is_enabled() and checkpoint.get('scaler'):
                 scaler.load_state_dict(checkpoint['scaler'])
             elif scaler.is_enabled():
@@ -288,8 +365,9 @@ def train(args):
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             train_data,
-            num_replicas=torch.cuda.device_count(),
-            rank=args.local_rank
+            num_replicas=world_size,
+            rank=torch.distributed.get_rank(),
+            drop_last=True,
         )
     else:
         train_sampler = None
@@ -301,16 +379,27 @@ def train(args):
     train_loader = DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=train_sampler is None,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
                               sampler=train_sampler, **loader_worker_options)
+    if args.resume_batch_skip >= len(train_loader):
+        raise ValueError(
+            f"resume_batch_skip={args.resume_batch_skip} must be less than "
+            f"the {len(train_loader)} batches in an epoch"
+        )
+    if is_main_process and args.resume_batch_skip:
+        logging.info(
+            "Replaying and skipping %d batches in resumed epoch %d to restore "
+            "the DataLoader/augmentation cursor", args.resume_batch_skip, start_epoch,
+        )
 
     total_steps = start_step
     epoch = start_epoch
-    logger = Logger(model, scheduler, args.name)
-    logger.total_steps = total_steps
+    logger = Logger(model, scheduler, args.name) if is_main_process else None
+    if logger is not None:
+        logger.total_steps = total_steps
 
     model.train()
-    if not args.distributed:
-        model_without_ddp.freeze_bn()
-    should_keep_training = total_steps < args.num_steps
+    model_without_ddp.freeze_bn()
+    stop_step = args.stop_after_step or args.num_steps
+    should_keep_training = total_steps < stop_step
     reported_grad_stride_mismatch = False
     amp_overflow_count = 0
     nonfinite_gradient_count = 0
@@ -323,7 +412,9 @@ def train(args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        for i_batch, data_blob in enumerate(tqdm(train_loader)):
+        for i_batch, data_blob in enumerate(tqdm(train_loader, disable=not is_main_process)):
+            if epoch == start_epoch and i_batch < args.resume_batch_skip:
+                continue
             if accumulated_microbatches == 0:
                 optimizer.zero_grad(set_to_none=True)
             image1 = data_blob["img1"].cuda(non_blocking=True)
@@ -365,8 +456,19 @@ def train(args):
                         gru_grad_lambda=args.gru_grad_lambda,
                         init_branch_loss_weight=args.init_branch_loss_weight,
                         debug_finite=args.debug_nan,
+                        **(
+                            {
+                                'raw_init_disps': aux['waft_init_disps'],
+                                'bin_loss_mode': 'smooth_l1',
+                                'bin_disp_smooth_l1_weight': args.bin_disp_smooth_l1_weight,
+                            }
+                            if (
+                                args.model_arch in ('cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only')
+                                or (args.model_arch == 'cor_ga_no_mono_igev' and args.bin_loss_mode == 'smooth_l1')
+                            ) else {}
+                        ),
                     )
-                    if args.model_arch in ('cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_fast_bininit', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_fast_binmono', 'cor_ga_fast_binmono_corrstats'):
+                    if args.model_arch in ('cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_fast_bininit', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only', 'cor_ga_fast_binmono', 'cor_ga_fast_binmono_corrstats'):
                         coarse_valid_masks = coarse_branch_valid_masks(
                             init_bins,
                             aux['init_valid'],
@@ -382,16 +484,18 @@ def train(args):
                             metrics[f'coarse_valid_ratio_{branch_index}'] = (
                                 branch_valid.float().mean().detach()
                             )
-                            coarse_losses.append(
-                                sequence_loss_d0L1(
-                                    branch_predictions,
-                                    disp_gt,
-                                    branch_valid,
-                                    loss_gamma=args.loss_gamma,
-                                    max_flow=args.train_max_disp,
-                                    smooth_l1_beta=args.smooth_l1_beta,
-                                    debug_finite=args.debug_nan,
-                                )[0]
+                            branch_loss, branch_metrics = sequence_loss_d0L1(
+                                branch_predictions,
+                                disp_gt,
+                                branch_valid,
+                                loss_gamma=args.loss_gamma,
+                                max_flow=args.train_max_disp,
+                                smooth_l1_beta=args.smooth_l1_beta,
+                                debug_finite=args.debug_nan,
+                            )
+                            coarse_losses.append(branch_loss)
+                            metrics[f'coarse_epe_{branch_index}'] = torch.nan_to_num(
+                                branch_metrics['epe'], nan=0.0
                             )
                         coarse_loss = (
                             torch.stack(coarse_losses).mean()
@@ -408,7 +512,7 @@ def train(args):
                     coarse_loss = torch.stack(coarse_losses).mean() if coarse_losses else main_loss.new_tensor(0.0)
                     loss = main_loss + args.coarse_loss_weight * coarse_loss
             except (AssertionError, FloatingPointError) as error:
-                if args.local_rank == 0 and args.debug_nan:
+                if is_main_process and args.debug_nan:
                     nonfinite_outputs = []
                     for prediction_index, prediction in enumerate(disp_predictions):
                         nan_count = torch.isnan(prediction).sum().item()
@@ -440,7 +544,7 @@ def train(args):
             metrics['init_loss'] = (
                 init_metric.detach()
                 if torch.is_tensor(init_metric) else float(init_metric)
-            )
+            ) + metrics.get('bin_disp_weighted_smooth_l1', 0.0)
             metrics['total_loss'] = loss.detach()
 
             scaler.scale(loss / args.gradient_accumulation_steps).backward()
@@ -448,7 +552,7 @@ def train(args):
             if accumulated_microbatches < args.gradient_accumulation_steps:
                 continue
 
-            if (not reported_grad_stride_mismatch) and args.distributed and args.local_rank == 0:
+            if (not reported_grad_stride_mismatch) and args.distributed and is_main_process:
                 mismatch_lines = []
                 for name, param in model_without_ddp.named_parameters():
                     if param.grad is None:
@@ -464,6 +568,29 @@ def train(args):
                     reported_grad_stride_mismatch = True
 
             scaler.unscale_(optimizer)
+            if is_main_process and args.diagnostic_grad_freq > 0 and total_steps % args.diagnostic_grad_freq == 0:
+                diagnostic_modules = {
+                    'bin_initializer': model_without_ddp.bin_initializer,
+                    'coarse_0': model_without_ddp.coarse_update_blocks[0],
+                    'coarse_1': model_without_ddp.coarse_update_blocks[1],
+                    'coarse_2': model_without_ddp.coarse_update_blocks[2],
+                    'refine': model_without_ddp.refine_update_block,
+                    'refine_state_projections': model_without_ddp.refine_state_projections,
+                    'stereo_encoder': model_without_ddp.stereo_encoder,
+                    'context_encoder': model_without_ddp.cnet,
+                    'gate': model_without_ddp.hypothesis_weight_head,
+                }
+                for module_name, module in diagnostic_modules.items():
+                    module_grad_norm = clip_grad_norm_stable(module.parameters(), float('inf'))
+                    logger.writer.add_scalar(f'diagnostic/grad_norm/{module_name}',
+                                             module_grad_norm.detach().item(), total_steps)
+                for parameter_name in (
+                    'refine_update_block.mask.0.weight',
+                    'refine_state_projections.0.weight',
+                ):
+                    parameter = model_without_ddp.get_parameter(parameter_name)
+                    logger.writer.add_scalar(f'diagnostic/param_norm/{parameter_name}',
+                                             parameter.detach().float().norm().item(), total_steps)
             stable_clip_architectures = (
                 'cor_ga',
                 'cor_ga_fast',
@@ -472,6 +599,8 @@ def train(args):
                 'cor_ga_no_mono_head',
                 'cor_ga_no_mono_igev',
                 'cor_ga_stereo_igev',
+                'cor_ga_stereo_igevpp_encoder',
+                'cor_ga_stereo_igevpp_encoder_coarse_corr_only',
                 'cor_ga_fast_pairres',
                 'cor_ga_fast_bininit',
                 'cor_ga_fast_binmono',
@@ -496,7 +625,7 @@ def train(args):
                 and grad_norm_value > args.large_grad_warn_threshold
             ):
                 large_gradient_count += 1
-                if args.local_rank == 0 and (
+                if is_main_process and (
                     large_gradient_count == 1 or large_gradient_count % 100 == 0
                 ):
                     logging.warning(
@@ -518,7 +647,7 @@ def train(args):
                     amp_overflow_count += 1
                     optimizer.zero_grad(set_to_none=True)
                     accumulated_microbatches = 0
-                    if args.local_rank == 0 and (amp_overflow_count == 1 or amp_overflow_count % 10 == 0):
+                    if is_main_process and (amp_overflow_count == 1 or amp_overflow_count % 10 == 0):
                         logging.warning(
                             "AMP gradient overflow #%d at optimizer step %d "
                             "(grad_norm=%s, scale %.1f -> %.1f); update skipped and scheduler held",
@@ -532,7 +661,7 @@ def train(args):
 
                 nonfinite_gradient_count += 1
                 save_failure_snapshot = (
-                    args.local_rank == 0
+                    is_main_process
                     and (not args.skip_nonfinite_gradients or nonfinite_gradient_count == 1)
                 )
                 if save_failure_snapshot:
@@ -543,7 +672,7 @@ def train(args):
                 if args.skip_nonfinite_gradients:
                     optimizer.zero_grad(set_to_none=True)
                     accumulated_microbatches = 0
-                    if args.local_rank == 0:
+                    if is_main_process:
                         logging.warning(
                             "Non-finite gradient #%d at optimizer step %d; batch skipped, "
                             "optimizer and scheduler held%s",
@@ -556,7 +685,7 @@ def train(args):
                             ),
                         )
                     continue
-                if args.local_rank == 0:
+                if is_main_process:
                     logging.error("Non-finite gradient norm %s at optimizer step %d; stopping before optimizer update. Batch saved to %s and model saved to %s", grad_norm.detach().item(), total_steps, failure_batch_path.absolute(), failure_model_path.absolute())
                 raise FloatingPointError(f"Non-finite gradient norm at optimizer step {total_steps}: {grad_norm.detach().item()}")
 
@@ -568,7 +697,7 @@ def train(args):
                 amp_overflow_count += 1
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_microbatches = 0
-                if args.local_rank == 0 and (amp_overflow_count == 1 or amp_overflow_count % 10 == 0):
+                if is_main_process and (amp_overflow_count == 1 or amp_overflow_count % 10 == 0):
                     logging.warning("AMP gradient overflow #%d at optimizer step %d; update skipped and scheduler held", amp_overflow_count, total_steps)
                 continue
             scheduler.step()
@@ -576,7 +705,7 @@ def train(args):
 
             total_steps += 1
 
-            if args.local_rank == 0:
+            if is_main_process:
                 if total_steps % 10 == 0:
                     logger.writer.add_scalar(
                         "train/live_loss", loss.detach(), total_steps
@@ -591,6 +720,15 @@ def train(args):
                     save_dict = {'model': model_without_ddp.state_dict(), 'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(), 'scaler': scaler.state_dict(), 'step': total_steps, 'epoch': epoch}
                     torch.save(save_dict, temporary_save_path)
                     os.replace(temporary_save_path, save_path)
+                    if (args.archive_full_ckpt_freq > 0
+                            and total_steps >= args.archive_full_ckpt_start_step
+                            and total_steps % args.archive_full_ckpt_freq == 0):
+                        archive_path = save_path.with_name(f'checkpoint_full_step_{total_steps:09d}.pth')
+                        # The latest checkpoint is replaced atomically at the next save,
+                        # so a hard link preserves this complete training state without
+                        # serializing the optimizer a second time.
+                        os.link(save_path, archive_path)
+                        logging.info("Archived full training state at %s", archive_path.absolute())
 
                 if total_steps % args.save_ckpt_freq == 0:
                     save_path = Path('checkpoints/%s/%s_%6d.pth' % (args.name, args.name, total_steps))
@@ -616,9 +754,12 @@ def train(args):
                         binmono_metrics=args.model_arch in ('cor_ga_fast_binmono', 'cor_ga_fast_binmono_corrstats'))
                     logger.write_dict(results)
                     model.train()
-                    if not args.distributed: model_without_ddp.freeze_bn()
+                    model_without_ddp.freeze_bn()
 
-            if total_steps >= args.num_steps:
+            if args.distributed and total_steps % args.val_freq == 0:
+                torch.distributed.barrier()
+
+            if total_steps >= stop_step:
                 should_keep_training = False
                 break
 
@@ -627,15 +768,22 @@ def train(args):
             accumulated_microbatches = 0
         epoch += 1
 
-        if len(train_loader) >= 10000:
+        if is_main_process and len(train_loader) >= 10000:
             save_path = Path('checkpoints/%s/%d_epoch_%s.pth.gz' % (args.name, total_steps, args.name))
             logging.info(f"Saving file {save_path}")
             torch.save(model_without_ddp.state_dict(), save_path)
 
-    print("FINISHED TRAINING")
-    logger.close()
+    if args.distributed:
+        torch.distributed.barrier()
+    if is_main_process:
+        print("FINISHED TRAINING")
+        logger.close()
     PATH = 'checkpoints/%s.pth' % args.name
-    torch.save(model_without_ddp.state_dict(), PATH)
+    if is_main_process:
+        torch.save(model_without_ddp.state_dict(), PATH)
+    if args.distributed:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
     return PATH
 
@@ -643,7 +791,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='defom-stereo', help="name your experiment")
-    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga_fast_binmono_corrstats', 'cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_fast3', 'cor_ga_fast2', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins3_gwc', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_bins6', 'cor_ga_bins_residual'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga_fast_binmono_corrstats', 'cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only', 'cor_ga_fast3', 'cor_ga_fast2', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins3_gwc', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_bins6', 'cor_ga_bins_residual'], help='model architecture')
 
     # resume pretrained model or resume training
     parser.add_argument('--resume_ckpt', default=None, type=str,
@@ -651,6 +799,25 @@ if __name__ == '__main__':
     parser.add_argument('--strict_resume', action='store_true',
                         help='strict resume while loading pretrained weights')
     parser.add_argument('--no_resume_optimizer', action='store_true')
+    parser.add_argument('--resume_batch_skip', default=0, type=int,
+                        help='replay and skip this many batches in the first resumed epoch')
+    parser.add_argument('--freeze_stereo_encoder', action='store_true',
+                        help='freeze the stereo matching encoder in a coarse-corr-only full-checkpoint resume')
+    parser.add_argument('--freeze_coarse_gru_motion', action='store_true',
+                        help='freeze coarse GRU layers and motion encoders in a coarse-corr-only full-checkpoint resume')
+    parser.add_argument('--freeze_refine_update_projection', action='store_true',
+                        help='freeze refine update block and state projections in a coarse-corr-only full-checkpoint resume')
+    parser.add_argument('--freeze_refine_update', action='store_true',
+                        help='freeze only the refine update block in a coarse-corr-only full-checkpoint resume')
+    parser.add_argument('--freeze_refine_projection', action='store_true',
+                        help='freeze only the refine state projections in a coarse-corr-only full-checkpoint resume')
+    parser.add_argument('--freeze_refine_component', default='',
+                        choices=['', 'motion_encoder', 'gru_layers', 'context_encoders', 'disp_head', 'mask'],
+                        help='freeze one refine update submodule in a coarse-corr-only full-checkpoint resume')
+    parser.add_argument('--match_encoder', default='igevpp', choices=['igevpp', 'dinov2'],
+                        help='image matching encoder for the controlled encoder A/B')
+    parser.add_argument('--paired_encoder_init', action='store_true',
+                        help='restore CPU RNG after building the image encoder so shared downstream weights start identically')
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
@@ -677,8 +844,18 @@ if __name__ == '__main__':
 
     # log
     parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
+    parser.add_argument('--stop_after_step', type=int, default=0,
+                        help='stop this run at an earlier optimizer step without changing the LR schedule')
     parser.add_argument('--save_ckpt_freq', default=10000, type=int, help='Save checkpoint frequency (steps)')
     parser.add_argument('--save_latest_ckpt_freq', default=1000, type=int)
+    parser.add_argument('--resume_lr_scale', default=1.0, type=float,
+                        help='multiply the restored optimizer and OneCycleLR schedule by this factor')
+    parser.add_argument('--diagnostic_grad_freq', default=0, type=int,
+                        help='log per-module pre-clip gradient norms at this optimizer-step interval; 0 disables')
+    parser.add_argument('--archive_full_ckpt_freq', default=0, type=int,
+                        help='retain a full model/optimizer/scheduler checkpoint at this step interval; 0 disables archival')
+    parser.add_argument('--archive_full_ckpt_start_step', default=0, type=int,
+                        help='first optimizer step eligible for full-checkpoint archival')
     parser.add_argument('--val_freq', default=10000, type=int, help='validation frequency in terms of training steps')
     parser.add_argument('--max_disp', type=int, default=48, help="maximum disparity")
     parser.add_argument('--train_max_disp', type=float, default=768.0, help="maximum full-resolution GT disparity supervised by training losses")
@@ -713,6 +890,10 @@ if __name__ == '__main__':
                         help='right-feature width compression used by cor_ga_bins GRU warp lookup')
     parser.add_argument('--loss_gamma', type=float, default=0.9, help='decay factor for successive recurrent L1 losses')
     parser.add_argument('--init_target_temperature', type=float, default=1.0, help='WAFT target temperature in full-resolution disparity pixels')
+    parser.add_argument('--bin_disp_smooth_l1_weight', type=float, default=0.2,
+                        help='weight for per-branch Smooth L1 supervision of raw bin disparity in cor_ga_stereo_igevpp_encoder')
+    parser.add_argument('--bin_loss_mode', choices=['soft_ce', 'smooth_l1'], default='soft_ce',
+                        help='bin supervision mode for cor_ga_no_mono_igev; other architectures retain their existing behavior')
     parser.add_argument('--gate_loss_weight', type=float, default=0.1, help='weight of direct hypothesis-gate soft cross-entropy')
     parser.add_argument('--gate_target_temperature', type=float, default=4.0, help='hypothesis-gate target temperature in full-resolution disparity pixels')
     parser.add_argument('--smooth_l1_beta', type=float, default=1.0, help='SmoothL1 beta for fused d0 in full-resolution disparity pixels')
@@ -727,6 +908,12 @@ if __name__ == '__main__':
     parser.add_argument('--use_gru_disp_grad_loss', action='store_true', help='add final-GRU disparity-gradient consistency loss')
     parser.add_argument('--gru_grad_lambda', type=float, default=0.02, help='weight of the optional final-GRU disparity-gradient loss')
     parser.add_argument('--max_delta_disp', type=float, default=8.0, help='smooth per-iteration disparity-update limit in quarter-resolution pixels')
+    parser.add_argument('--max_coarse_delta_disp', type=float, default=None,
+                        help='coarse-stage update limit in quarter-resolution pixels; defaults to --max_delta_disp')
+    parser.add_argument('--disable_delta_clamp', action='store_true',
+                        help='do not tanh-limit coarse or refinement updates; final disparity range clipping remains enabled')
+    parser.add_argument('--disable_coarse_delta_clamp', action='store_true',
+                        help='do not tanh-limit coarse updates; refinement retains --max_delta_disp')
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
     parser.add_argument('--corr_levels', type=int, default=2, help="number of levels in the shared right-coordinate FullCorr pyramid")
     parser.add_argument('--corr_radius', type=int, default=4, help="shared local radius for FullCorr and right-feature window sampling")

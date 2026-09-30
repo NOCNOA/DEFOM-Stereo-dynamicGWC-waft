@@ -126,6 +126,8 @@ def _parallel_structure(blocks, disps, static_features):
 
 def _parallel_motion(blocks, correlations, disps, warp_features):
     encoders = [block.motion_encoder for block in blocks]
+    if len({encoder.use_warp_features for encoder in encoders}) != 1:
+        raise ValueError("parallel motion encoders must agree on warp-feature use")
     correlation = _parallel_conv2d(
         [encoder.convc1 for encoder in encoders], correlations
     )
@@ -144,17 +146,22 @@ def _parallel_motion(blocks, correlations, disps, warp_features):
     )
     disparity = [F.relu(value, inplace=False) for value in disparity]
 
-    warp = _parallel_conv2d(
-        [encoder.convg1 for encoder in encoders], warp_features
-    )
-    warp = [F.relu(value, inplace=False) for value in warp]
-    warp = _parallel_conv2d([encoder.convg2 for encoder in encoders], warp)
-    warp = [F.relu(value, inplace=False) for value in warp]
-
-    joined = [
-        torch.cat([corr, disp_feature, warp_feature], dim=1)
-        for corr, disp_feature, warp_feature in zip(correlation, disparity, warp)
-    ]
+    if encoders[0].use_warp_features:
+        warp = _parallel_conv2d(
+            [encoder.convg1 for encoder in encoders], warp_features
+        )
+        warp = [F.relu(value, inplace=False) for value in warp]
+        warp = _parallel_conv2d([encoder.convg2 for encoder in encoders], warp)
+        warp = [F.relu(value, inplace=False) for value in warp]
+        joined = [
+            torch.cat([corr, disp_feature, warp_feature], dim=1)
+            for corr, disp_feature, warp_feature in zip(correlation, disparity, warp)
+        ]
+    else:
+        joined = [
+            torch.cat([corr, disp_feature], dim=1)
+            for corr, disp_feature in zip(correlation, disparity)
+        ]
     output = _parallel_conv2d([encoder.conv for encoder in encoders], joined)
     output = [F.relu(value, inplace=False) for value in output]
     return [

@@ -12,29 +12,31 @@ import torch.nn.functional as F
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from core.defom_cor_ga import DEFOMStereo as CorGAStereo, autocast
-from core.defom_cor_ga_coarse1 import DEFOMStereo as CorGACoarse1Stereo
-from core.defom_cor_ga_lite import DEFOMStereo as CorGALiteStereo
-from core.defom_cor_ga_fast import DEFOMStereo as CorGAFastStereo
-from core.defom_cor_ga_fast2 import DEFOMStereo as CorGAFast2Stereo
-from core.defom_cor_ga_fast3 import DEFOMStereo as CorGAFast3Stereo
-from core.defom_cor_ga_no_mono_head import DEFOMStereo as CorGANoMonoHeadStereo
-from core.defom_cor_ga_no_mono_igev import DEFOMStereo as CorGANoMonoIGEVStereo
-from core.defom_cor_ga_stereo_igev import DEFOMStereo as CorGAStereoIGEVStereo
-from core.defom_cor_ga_fast_pairres import DEFOMStereo as CorGAFastPairResidualStereo
-from core.defom_cor_ga_fast_bininit import DEFOMStereo as CorGAFastBinInitStereo
-from core.defom_cor_ga_fast_binmono import DEFOMStereo as CorGAFastBinMonoStereo
-from core.defom_cor_ga_fast_binmono_corrstats import DEFOMStereo as CorGAFastBinMonoCorrStatsStereo
-from core.defom_cor_ga_noh import DEFOMStereo as CorGANoHiddenStereo
-from core.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
-from core.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
-from core.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitStereo
-from core.defom_cor_ga_bins3_gwc import DEFOMStereo as CorGABins3GWCStereo
-from core.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
-from core.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
-from core.defom_cor_ga_bins5_shared_parallel import DEFOMStereo as CorGABins5SharedParallelStereo
-from core.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
-from core.defom_cor_ga_bins_residual import DEFOMStereo as CorGABinsResidualStereo
+from core.corga.defom_cor_ga import DEFOMStereo as CorGAStereo, autocast
+from core.corga.defom_cor_ga_coarse1 import DEFOMStereo as CorGACoarse1Stereo
+from core.corga.defom_cor_ga_lite import DEFOMStereo as CorGALiteStereo
+from core.corga.defom_cor_ga_fast import DEFOMStereo as CorGAFastStereo
+from core.corga.defom_cor_ga_fast2 import DEFOMStereo as CorGAFast2Stereo
+from core.corga.defom_cor_ga_fast3 import DEFOMStereo as CorGAFast3Stereo
+from core.corga.defom_cor_ga_no_mono_head import DEFOMStereo as CorGANoMonoHeadStereo
+from core.corga.defom_cor_ga_no_mono_igev import DEFOMStereo as CorGANoMonoIGEVStereo
+from core.corga.defom_cor_ga_stereo_igev import DEFOMStereo as CorGAStereoIGEVStereo
+from core.corga.defom_cor_ga_stereo_igevpp_encoder import DEFOMStereo as CorGAStereoIGEVPPEncoderStereo
+from core.corga.defom_cor_ga_stereo_igevpp_encoder_coarse_corr_only import DEFOMStereo as CorGAStereoIGEVPPEncoderCoarseCorrOnlyStereo
+from core.corga.defom_cor_ga_fast_pairres import DEFOMStereo as CorGAFastPairResidualStereo
+from core.corga.defom_cor_ga_fast_bininit import DEFOMStereo as CorGAFastBinInitStereo
+from core.corga.defom_cor_ga_fast_binmono import DEFOMStereo as CorGAFastBinMonoStereo
+from core.corga.defom_cor_ga_fast_binmono_corrstats import DEFOMStereo as CorGAFastBinMonoCorrStatsStereo
+from core.corga.defom_cor_ga_noh import DEFOMStereo as CorGANoHiddenStereo
+from core.bin.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
+from core.bin.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
+from core.bin.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitStereo
+from core.bin.defom_cor_ga_bins3_gwc import DEFOMStereo as CorGABins3GWCStereo
+from core.bin.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
+from core.bin.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
+from core.bin.defom_cor_ga_bins5_shared_parallel import DEFOMStereo as CorGABins5SharedParallelStereo
+from core.bin.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
+from core.bin.defom_cor_ga_bins_residual import DEFOMStereo as CorGABinsResidualStereo
 
 import core.stereo_datasets as datasets
 from core.utils.utils import InputPadder, upflow
@@ -564,7 +566,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", default=None)
     parser.add_argument('--datasets', nargs='+', type=str, help="dataset for evaluation", default=["things"],
-                        choices=["things", "eth3d", "kitti12", "kitti15"] + [f"middlebury_{s}" for s in ['F','H','Q','2021']])
+                        choices=["things", "eth3d", "kitti12", "kitti15", "mixed"] + [f"middlebury_{s}" for s in ['F','H','Q','2021']])
+    parser.add_argument('--mixed_names', nargs='+', default=None,
+                        help='datasets for mixed validation; defaults to all seven')
+    parser.add_argument('--mixed_root', action='append', default=[], metavar='NAME=PATH',
+                        help='override a dataset root; repeat for each dataset')
+    parser.add_argument('--mixed_manifest', action='append', default=[], metavar='NAME=FILE',
+                        help='left-image paths defining a validation subset; repeat as needed')
+    parser.add_argument('--mixed_max_samples', type=int, default=100,
+                        help='maximum samples per dataset (default: 100; smaller datasets use all samples)')
+    parser.add_argument('--unreal_scene', default='00008',
+                        help='UnrealStereo4K scene; 00008 is the out-of-domain test scene')
+    parser.add_argument('--mixed_bad_threshold', type=float, default=3.0)
     parser.add_argument('--indetail', action='store_true', help='evaluate middlebury in detail (for different regions)')
     parser.add_argument('--max_disp', type=int, default=768, help='evaluate middlebury in detail (for different regions)')
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
@@ -572,7 +585,7 @@ if __name__ == '__main__':
     parser.add_argument('--scale_iters', type=int, default=20, help="number of coarse aggregation updates for each disparity hypothesis.")
 
     # Architecure choices
-    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga_fast_binmono_corrstats', 'cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_fast3', 'cor_ga_fast2', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins3_gwc', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_bins6', 'cor_ga_bins_residual'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga', choices=['cor_ga_fast_binmono_corrstats', 'cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only', 'cor_ga_fast3', 'cor_ga_fast2', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins3_gwc', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_bins6', 'cor_ga_bins_residual'], help='model architecture')
     parser.add_argument('--amp_dtype', choices=['fp16', 'bf16'], default='fp16', help='autocast dtype used inside models with --mixed_precision')
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='maximum bin offset in each compressed right-feature coordinate')
@@ -584,6 +597,12 @@ if __name__ == '__main__':
     parser.add_argument('--corr_stats_hidden', type=int, default=32, help='hidden channels in the refine correlation-statistics residual adapter')
     parser.add_argument('--corr_stats_temperature', type=float, default=1.0, help='softmax temperature after local correlation standardization')
     parser.add_argument('--max_delta_disp', type=float, default=8.0, help='smooth per-iteration disparity-update limit in quarter-resolution pixels')
+    parser.add_argument('--max_coarse_delta_disp', type=float, default=None,
+                        help='coarse-stage update limit in quarter-resolution pixels; defaults to --max_delta_disp')
+    parser.add_argument('--disable_delta_clamp', action='store_true',
+                        help='do not tanh-limit coarse or refinement updates; final disparity range clipping remains enabled')
+    parser.add_argument('--disable_coarse_delta_clamp', action='store_true',
+                        help='do not tanh-limit coarse updates; refinement retains --max_delta_disp')
     parser.add_argument('--dinov2_encoder', type=str, default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--hypothesis_scales', type=float, nargs=3, default=[24.0, 48.0, 96.0],
                         help='three quarter-resolution scales applied to normalized monocular inverse depth; ignored by bin-initialized models')
@@ -611,6 +630,8 @@ if __name__ == '__main__':
         'cor_ga_no_mono_head': CorGANoMonoHeadStereo,
         'cor_ga_no_mono_igev': CorGANoMonoIGEVStereo,
         'cor_ga_stereo_igev': CorGAStereoIGEVStereo,
+        'cor_ga_stereo_igevpp_encoder': CorGAStereoIGEVPPEncoderStereo,
+        'cor_ga_stereo_igevpp_encoder_coarse_corr_only': CorGAStereoIGEVPPEncoderCoarseCorrOnlyStereo,
         'cor_ga_fast_pairres': CorGAFastPairResidualStereo,
         'cor_ga_fast_bininit': CorGAFastBinInitStereo,
         'cor_ga_fast_binmono': CorGAFastBinMonoStereo,
@@ -660,6 +681,29 @@ if __name__ == '__main__':
 
     if 'things' in args.datasets:
         validate_things(model, iters=args.valid_iters, scale_iters=args.scale_iters, mixed_prec=use_mixed_precision, max_disp=args.max_disp)
+
+    if 'mixed' in args.datasets:
+        from core.mixed_validation import NAMES, validate_mixed
+
+        def parse_named_paths(values, argument):
+            result = {}
+            for value in values:
+                name, separator, path = value.partition('=')
+                valid_names = NAMES + (('vkitti2_depth',) if argument == '--mixed_root' else ())
+                if not separator or name not in valid_names or not path or name in result:
+                    parser.error(f"invalid {argument} value: {value!r}; expected unique NAME=PATH")
+                result[name] = path
+            return result
+
+        names = args.mixed_names or list(NAMES)
+        if len(names) != len(set(names)) or any(name not in NAMES for name in names):
+            parser.error(f"--mixed_names must contain unique names from: {', '.join(NAMES)}")
+        roots = parse_named_paths(args.mixed_root, '--mixed_root')
+        manifests = parse_named_paths(args.mixed_manifest, '--mixed_manifest')
+        validate_mixed(model, names, roots, manifests, iters=args.valid_iters,
+                       scale_iters=args.scale_iters, mixed_prec=use_mixed_precision,
+                       max_disp=args.max_disp, bad_threshold=args.mixed_bad_threshold,
+                       max_samples=args.mixed_max_samples, unreal_scene=args.unreal_scene)
 
     if 'eth3d' in args.datasets:
         validate_eth3d(model, iters=args.valid_iters, scale_iters=args.scale_iters, mixed_prec=use_mixed_precision)

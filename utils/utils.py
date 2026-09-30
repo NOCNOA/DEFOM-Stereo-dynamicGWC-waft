@@ -157,12 +157,15 @@ def sequence_loss_multi_init_waft(
     gru_grad_lambda=0.02,
     init_branch_loss_weight=None,
     debug_finite=False,
+    raw_init_disps=None,
+    bin_loss_mode='soft_ce',
+    bin_disp_smooth_l1_weight=0.0,
 ):
     """WAFT initialization losses plus optional edge supervision on GRU outputs only.
 
-    The bin classification, hypothesis gate, and fused d0 losses are deliberately
-    left unchanged. Edge weights are applied only to ``flow_preds[1:]``; the
-    optional disparity-gradient term is computed from the final GRU prediction.
+    Bin supervision is either soft CE or Smooth L1 on each branch's expected
+    disparity, restricted to pixels covered by its valid bins. Edge weights
+    apply only to ``flow_preds[1:]``.
     """
     if not isinstance(flow_preds, (list, tuple)):
         flow_preds = [flow_preds]
@@ -178,6 +181,12 @@ def sequence_loss_multi_init_waft(
         raise ValueError(f"gate_loss_weight must be non-negative, got {gate_loss_weight}")
     if d0_loss_weight < 0:
         raise ValueError(f"d0_loss_weight must be non-negative, got {d0_loss_weight}")
+    if bin_loss_mode not in ('soft_ce', 'smooth_l1'):
+        raise ValueError(f"Unsupported bin_loss_mode: {bin_loss_mode}")
+    if bin_disp_smooth_l1_weight < 0:
+        raise ValueError(f"bin_disp_smooth_l1_weight must be non-negative, got {bin_disp_smooth_l1_weight}")
+    if bin_loss_mode == 'smooth_l1' and raw_init_disps is None:
+        raise ValueError("raw_init_disps is required when bin_loss_mode is smooth_l1")
     if gru_edge_lambda < 0 or gru_grad_lambda < 0:
         raise ValueError(
             f"gru_edge_lambda and gru_grad_lambda must be non-negative, got "
@@ -188,6 +197,8 @@ def sequence_loss_multi_init_waft(
     if init_disps.ndim != 4:
         raise ValueError(f"init_disps must be [B,R,H,W], got {tuple(init_disps.shape)}")
     batch, num_ranges, height, width = init_disps.shape
+    if raw_init_disps is not None and tuple(raw_init_disps.shape) != tuple(init_disps.shape):
+        raise ValueError(f"raw_init_disps must match init_disps, got {tuple(raw_init_disps.shape)} and {tuple(init_disps.shape)}")
     if init_logits.ndim != 5 or init_logits.shape[:2] != (batch, num_ranges) or init_logits.shape[-2:] != (height, width):
         raise ValueError(f"init_logits must be [B,R,K,H,W] and match init_disps, got {tuple(init_logits.shape)} and {tuple(init_disps.shape)}")
     if tuple(init_valid.shape) != tuple(init_logits.shape):
@@ -207,6 +218,7 @@ def sequence_loss_multi_init_waft(
     valid_low = F.interpolate(valid, size=(height, width), mode='nearest') >= 0.5
     valid_low = valid_low & torch.isfinite(gt_low) & (gt_low >= 0.0) & (gt_low * float(downsample) < float(max_flow))
     init_classification_losses = []
+    bin_disparity_l1_losses = []
     branch_eligible_masks = []
     for branch_index in range(num_ranges):
         bins_low = init_bins[branch_index].float().view(1, num_bins, 1, 1)
@@ -217,18 +229,34 @@ def sequence_loss_multi_init_waft(
         min_valid_bin = valid_bins_low.masked_fill(~candidate_valid, float('inf')).amin(dim=1, keepdim=True)
         max_valid_bin = valid_bins_low.masked_fill(~candidate_valid, float('-inf')).amax(dim=1, keepdim=True)
         branch_valid = valid_low & candidate_exists & (gt_low >= min_valid_bin) & (gt_low <= max_valid_bin)
-        target_logits = -(bins_full - gt_for_target).abs() / float(init_target_temperature)
-        target_probability = torch.softmax(target_logits.masked_fill(~candidate_valid, -1e4), dim=1) * candidate_valid.float()
-        target_probability = (target_probability / target_probability.sum(dim=1, keepdim=True).clamp_min(1e-6)).detach()
-        prediction_logits = init_logits[:, branch_index].float().masked_fill(~candidate_valid, -1e4)
-        classification_map = -(target_probability * F.log_softmax(prediction_logits, dim=1)).sum(dim=1, keepdim=True)
         branch_valid_float = branch_valid.float()
-        init_classification_losses.append(
-            (classification_map * branch_valid_float).sum()
-            / branch_valid_float.sum().clamp_min(1.0)
-        )
+        if bin_loss_mode == 'soft_ce':
+            target_logits = -(bins_full - gt_for_target).abs() / float(init_target_temperature)
+            target_probability = torch.softmax(target_logits.masked_fill(~candidate_valid, -1e4), dim=1) * candidate_valid.float()
+            target_probability = (target_probability / target_probability.sum(dim=1, keepdim=True).clamp_min(1e-6)).detach()
+            prediction_logits = init_logits[:, branch_index].float().masked_fill(~candidate_valid, -1e4)
+            classification_map = -(target_probability * F.log_softmax(prediction_logits, dim=1)).sum(dim=1, keepdim=True)
+            init_classification_losses.append(
+                (classification_map * branch_valid_float).sum()
+                / branch_valid_float.sum().clamp_min(1.0)
+            )
+        else:
+            raw_disp_full = raw_init_disps[:, branch_index:branch_index + 1].float() * float(downsample)
+            if debug_finite:
+                assert torch.isfinite(raw_disp_full).all()
+            bin_disparity_l1_losses.append(
+                (F.smooth_l1_loss(raw_disp_full, gt_for_target, reduction='none', beta=float(smooth_l1_beta)) * branch_valid_float).sum()
+                / branch_valid_float.sum().clamp_min(1.0)
+            )
         branch_eligible_masks.append(branch_valid)
-    init_classification_loss = torch.stack(init_classification_losses).sum()
+    init_classification_loss = (
+        torch.stack(init_classification_losses).sum()
+        if init_classification_losses else flow_gt.new_tensor(0.0)
+    )
+    bin_disparity_l1 = (
+        torch.stack(bin_disparity_l1_losses).mean()
+        if bin_disparity_l1_losses else flow_gt.new_tensor(0.0)
+    )
     branch_eligible = torch.cat(branch_eligible_masks, dim=1)
     gate_error = (init_disps.detach().float() * float(downsample) - gt_for_target).abs()
     gate_target_logits = (-gate_error / float(gate_target_temperature)).masked_fill(~branch_eligible, -1e4)
@@ -303,6 +331,7 @@ def sequence_loss_multi_init_waft(
 
     total_loss = (
         init_classification_loss
+        + float(bin_disp_smooth_l1_weight) * bin_disparity_l1
         + float(gate_loss_weight) * gate_loss
         + float(d0_loss_weight) * d0_loss
         + recurrent_loss
@@ -339,6 +368,11 @@ def sequence_loss_multi_init_waft(
     }
     for branch_index, branch_loss in enumerate(init_classification_losses):
         metrics[f'init_soft_ce_{branch_index}'] = branch_loss.detach()
+    if bin_disparity_l1_losses:
+        metrics['bin_disp_smooth_l1'] = bin_disparity_l1.detach()
+        metrics['bin_disp_weighted_smooth_l1'] = (float(bin_disp_smooth_l1_weight) * bin_disparity_l1).detach()
+        for branch_index, branch_loss in enumerate(bin_disparity_l1_losses):
+            metrics[f'bin_disp_smooth_l1_{branch_index}'] = branch_loss.detach()
     return total_loss, metrics
 
 
@@ -778,8 +812,17 @@ def sequence_loss_smoothness(
 
 def fetch_optimizer(args, model, last_epoch=-1, checkpoint=None):
     """ Create the optimizer and learning rate scheduler """
+    # Keep the original parameter-group layout when resuming with selected
+    # modules frozen. Parameters without gradients are skipped by AdamW, but
+    # retaining them keeps the saved optimizer state load-compatible.
     trainable_params = [parameter for parameter in model.parameters()
-                        if parameter.requires_grad]
+                        if parameter.requires_grad
+                        or getattr(args, 'freeze_stereo_encoder', False)
+                        or getattr(args, 'freeze_coarse_gru_motion', False)
+                        or getattr(args, 'freeze_refine_update_projection', False)
+                        or getattr(args, 'freeze_refine_update', False)
+                        or getattr(args, 'freeze_refine_projection', False)
+                        or bool(getattr(args, 'freeze_refine_component', ''))]
     optimizer = optim.AdamW(
         trainable_params, lr=args.lr, weight_decay=args.wdecay, eps=1e-8,
     )

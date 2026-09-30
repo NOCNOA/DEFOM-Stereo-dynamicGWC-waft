@@ -1250,11 +1250,6 @@ def lookup_right_features(
     sampled tensors are converted back to the feature dtype before fusion so
     the large window and attention activations can use mixed precision.
     """
-    if fmap1_low.ndim != 4:
-        raise ValueError(f"fmap1_low must be [B,C,H,W], got {tuple(fmap1_low.shape)}")
-    if len(right_feature_pyramid) != len(compression_ratios):
-        raise ValueError("right_feature_pyramid and compression_ratios must have equal length")
-
     sampled_right = sample_right_feature_pyramid(
         right_feature_pyramid,
         disp,
@@ -1267,9 +1262,6 @@ def lookup_right_features(
     batch, channels, height, width = fmap1_low.shape
     num_scales = len(compression_ratios)
     num_samples = sampled_right.shape[1]
-    if num_samples % num_scales != 0:
-        raise RuntimeError(f"Cannot split {num_samples} samples into {num_scales} scales")
-
     samples_per_scale = num_samples // num_scales
     sampled_right = sampled_right.reshape(batch, num_scales, samples_per_scale, channels, height, width)
 

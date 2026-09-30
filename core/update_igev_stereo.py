@@ -39,7 +39,8 @@ class StereoIGEVUpdateBlock(nn.Module):
     """
 
     def __init__(self, args, hidden_dim, feat_dim, volume_dim,
-                 warp_feat_dim, cor_planes=None, num_layers=None):
+                 warp_feat_dim, cor_planes=None, num_layers=None,
+                 use_warp_features=True):
         super().__init__()
         del feat_dim
         self.num_layers = (
@@ -55,7 +56,8 @@ class StereoIGEVUpdateBlock(nn.Module):
                 args.corr_levels * (2 * args.corr_radius + 1) * volume_dim
             )
         self.motion_encoder = MotionEncoder(
-            hidden_dim, cor_planes, warp_feat_dim
+            hidden_dim, cor_planes, warp_feat_dim,
+            use_warp_features=use_warp_features,
         )
 
         # The current CorGA context encoder exposes a finest-scale context
