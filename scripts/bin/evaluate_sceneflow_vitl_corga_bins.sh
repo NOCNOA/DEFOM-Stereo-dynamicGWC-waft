@@ -7,7 +7,7 @@ cd "${REPO_ROOT}"
 
 GPU_ID="${GPU_ID:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-CHECKPOINT="${CHECKPOINT:-checkpoints/defomstereo_vitl_corga_bins_48_avg_fp32stable/defomstereo_vitl_corga_bins_48_avg_fp32stable_200000.pth}"
+CHECKPOINT="${CHECKPOINT:-checkpoints/defomstereo_vitl_corga_bins_48_avg/checkpoint_latest.pth}"
 
 if [[ ! -s "${CHECKPOINT}" ]]; then
     echo "Checkpoint does not exist or is empty: ${CHECKPOINT}" >&2

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODE="${1:-fresh}"
-EXPERIMENT_NAME="defomstereo_vitl_corga_bins_no_rope"
+EXPERIMENT_NAME="defomstereo_vitl_corga_bins_48_avg"
 CHECKPOINT_DIR="checkpoints/${EXPERIMENT_NAME}"
 LATEST_CKPT="${CHECKPOINT_DIR}/checkpoint_latest.pth"
 
@@ -31,7 +31,7 @@ esac
 mkdir -p "${CHECKPOINT_DIR}"
 echo "mode=${MODE} experiment=${EXPERIMENT_NAME} gpu=0"
 CUDA_VISIBLE_DEVICES=0 python train_stereo.py \
---model_arch cor_ga_bins2 \
+--model_arch cor_ga_bins \
 --launcher none \
 --gpu_ids 0 \
 --name "${EXPERIMENT_NAME}" \

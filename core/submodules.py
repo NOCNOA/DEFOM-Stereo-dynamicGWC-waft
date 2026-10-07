@@ -1243,12 +1243,16 @@ def lookup_right_features(
     scale_weights=None,
     compression_ratios=(1, 2, 4),
     compact_sampling=False,
+    sample_conditioner=None,
 ):
     """Sample and fuse local right-feature windows at the current disparity.
 
     Grid sampling stays in FP32 inside sample_right_feature_pyramid. The
     sampled tensors are converted back to the feature dtype before fusion so
     the large window and attention activations can use mixed precision.
+    sample_conditioner, when supplied, receives the left feature and sampled
+    right features [B,scale,offset,C,H,W] and returns conditioned samples plus
+    an optional [B,C,H,W] residual for the fused feature.
     """
     sampled_right = sample_right_feature_pyramid(
         right_feature_pyramid,
@@ -1264,6 +1268,9 @@ def lookup_right_features(
     num_samples = sampled_right.shape[1]
     samples_per_scale = num_samples // num_scales
     sampled_right = sampled_right.reshape(batch, num_scales, samples_per_scale, channels, height, width)
+    feature_residual = None
+    if sample_conditioner is not None:
+        sampled_right, feature_residual = sample_conditioner(fmap1_low, sampled_right)
 
     if scale_weights is None:
         if num_scales != 1:
@@ -1280,6 +1287,8 @@ def lookup_right_features(
     del fused_input
     if rope_galerkin is not None:
         fused_feature = rope_galerkin(fused_feature)
+    if feature_residual is not None:
+        fused_feature = fused_feature + feature_residual.to(fused_feature.dtype)
 
     return fused_feature
 

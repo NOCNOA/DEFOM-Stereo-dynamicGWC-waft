@@ -20,6 +20,7 @@ nohup.out
 nohup*.out
 nohups/
 *.md 
+!CORGA_MATCH.md
 *.txt
 # Model weights / checkpoints
 checkpoints/

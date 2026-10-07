@@ -115,6 +115,8 @@ def sample_right_feature_pyramid(
     padding_mode='zeros',
     align_corners=True,
     compact=False,
+    return_valid=False,
+    height_compression_ratios=None,
 ):
     """Sample right features around the current left-view disparity.
 
@@ -125,9 +127,14 @@ def sample_right_feature_pyramid(
         disp: current disparity [B,1,H,W] in the uncompressed 1/4-feature unit.
         offsets: one-dimensional offsets in each branch's compressed-cell unit.
         compression_ratios: width compression ratio for every right feature.
+        height_compression_ratios: optional height ratios for spatial source
+            pyramids. None preserves the original width-only sampling path.
 
     Returns:
         Sampled right features [B, num_scales*num_offsets, C, H, W].
+        If return_valid=True, also return an in-bounds coordinate mask with
+        shape [B, num_scales*num_offsets, 1, H, W]. This is geometric validity,
+        not an occlusion mask. The default return value is unchanged.
 
     For a width-stride convolution with kernel_size == stride == ratio,
     compressed coordinate j has its center at
@@ -140,6 +147,8 @@ def sample_right_feature_pyramid(
         raise ValueError(f"disp must be [B,1,H,W], got {tuple(disp.shape)}")
     if len(right_features) != len(compression_ratios):
         raise ValueError(f"Expected one compression ratio per feature, got {len(right_features)} features and {len(compression_ratios)} ratios")
+    if height_compression_ratios is not None and len(height_compression_ratios) != len(right_features):
+        raise ValueError('Expected one height compression ratio per feature')
 
     batch, _, query_height, query_width = disp.shape
     offsets = torch.as_tensor(offsets, device=disp.device, dtype=disp.dtype).flatten()
@@ -149,11 +158,15 @@ def sample_right_feature_pyramid(
     x_left = torch.arange(query_width, device=disp.device, dtype=disp.dtype).view(1, 1, 1, query_width)
     y = torch.arange(query_height, device=disp.device, dtype=disp.dtype).view(1, 1, query_height, 1)
     sampled_scales = []
+    valid_scales = []
 
-    for right_feat, ratio in zip(right_features, compression_ratios):
+    for scale, (right_feat, ratio) in enumerate(zip(right_features, compression_ratios)):
         if right_feat.ndim != 4:
             raise ValueError(f"Every right feature must be [B,C,H,W], got {tuple(right_feat.shape)}")
-        if right_feat.shape[0] != batch or right_feat.shape[2] != query_height:
+        height_ratio = 1 if height_compression_ratios is None else height_compression_ratios[scale]
+        if height_ratio < 1 or int(height_ratio) != height_ratio:
+            raise ValueError('Height compression ratios must be positive integers')
+        if right_feat.shape[0] != batch or right_feat.shape[2] != query_height // int(height_ratio):
             raise ValueError(f"Right feature batch/height must match disp, got {tuple(right_feat.shape)} and {tuple(disp.shape)}")
         if ratio < 1:
             raise ValueError(f"compression ratios must be positive, got {ratio}")
@@ -163,7 +176,12 @@ def sample_right_feature_pyramid(
         center_offset = (float(ratio) - 1.0) / 2.0
         x_right = (x_left - disp - center_offset) / float(ratio)
         x_right = x_right + offsets.view(1, -1, 1, 1)
-        y_right = y.expand(batch, offsets.numel(), query_height, query_width)
+        y_source = y if height_ratio == 1 else (y - (float(height_ratio) - 1.) / 2.) / float(height_ratio)
+        y_right = y_source.expand(batch, offsets.numel(), query_height, query_width)
+        if return_valid:
+            valid = ((x_right >= 0) & (x_right <= source_width - 1)
+                     & (y_right >= 0) & (y_right <= source_height - 1))
+            valid_scales.append(valid.unsqueeze(2))
 
         if align_corners:
             x_norm = 2.0 * x_right / max(source_width - 1, 1) - 1.0
@@ -215,4 +233,7 @@ def sample_right_feature_pyramid(
                 )
         sampled_scales.append(sampled.to(right_feat.dtype))
 
-    return torch.cat(sampled_scales, dim=1) #batch, sample_count*level, channels, query_height, query_width
+    sampled = torch.cat(sampled_scales, dim=1)
+    if return_valid:
+        return sampled, torch.cat(valid_scales, dim=1)
+    return sampled

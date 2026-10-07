@@ -61,7 +61,8 @@ def horizontal_linear_sample(source, x):
 
 
 def sample_right_feature_pyramid_horizontal(
-    right_features, disp, offsets, coordinate_cache, compression_ratios=(1, 2, 4)
+    right_features, disp, offsets, coordinate_cache, compression_ratios=(1, 2, 4),
+    return_valid=False,
 ):
     """Horizontal equivalent of sample_right_feature_pyramid."""
     if disp.ndim != 4 or disp.shape[1] != 1:
@@ -78,7 +79,10 @@ def sample_right_feature_pyramid_horizontal(
         raise ValueError("offsets must contain at least one value")
     x_left = coordinate_cache.x(query_width, disp.device, torch.float32)
     sampled_scales = []
+    valid_scales = []
     for right_feature, ratio in zip(right_features, compression_ratios):
+        if right_feature.ndim != 4 or ratio < 1:
+            raise ValueError('Right features must be [B,C,H,W] and compression ratios positive')
         if right_feature.shape[0] != batch or right_feature.shape[2] != query_height:
             raise ValueError(
                 f"Right feature batch/height must match disp, got "
@@ -87,10 +91,15 @@ def sample_right_feature_pyramid_horizontal(
         center_offset = (float(ratio) - 1.0) / 2.0
         x_right = (x_left - disp_fp32 - center_offset) / float(ratio)
         x_right = x_right + offsets.view(1, -1, 1, 1)
+        if return_valid:
+            valid_scales.append(((x_right >= 0) & (x_right <= right_feature.shape[-1] - 1)).unsqueeze(2))
         with torch.cuda.amp.autocast(enabled=False):
             sampled = horizontal_linear_sample(right_feature.float(), x_right)
         sampled_scales.append(sampled.to(right_feature.dtype))
-    return torch.cat(sampled_scales, dim=1)
+    sampled = torch.cat(sampled_scales, dim=1)
+    if return_valid:
+        return sampled, torch.cat(valid_scales, dim=1)
+    return sampled
 
 
 def lookup_right_features_horizontal(

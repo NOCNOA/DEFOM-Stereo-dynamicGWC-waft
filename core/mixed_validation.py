@@ -16,6 +16,69 @@ from core.utils.utils import InputPadder
 NAMES = ("sceneflow", "middlebury_H", "middlebury_F", "unrealstereo4k", "sintel_stereo",
          "crestereo", "tartan_air", "vkitti2")
 
+REFINE_BUCKETS = ((0, 192, "0-192"), (192, 384, "192-384"),
+                  (384, 512, "384-512"), (512, 768, "512-768"))
+
+
+@torch.no_grad()
+def validate_refine_curve(model, names, roots, manifests, iters, scale_iters,
+                          max_disp, max_samples, result_path):
+    """Record pixel-weighted EPE numerators for d0 and every refine update."""
+    model.eval()
+    device = next(model.parameters()).device
+    completed = {}
+    output_path = Path(result_path)
+    if output_path.exists():
+        for line in output_path.read_text().splitlines():
+            if line.strip():
+                row = json.loads(line)
+                if row["left"] in completed:
+                    raise ValueError(f"Duplicate image in {output_path}: {row['left']}")
+                completed[row["left"]] = row
+    for name in names:
+        dataset = make_dataset(name, roots)
+        indices = select_indices(dataset, manifests.get(name), max_samples)
+        for index in tqdm(indices, desc=f"{name} refine curve"):
+            left_path = dataset.image_list[index][0]
+            if left_path in completed:
+                continue
+            sample = dataset[index]
+            left = sample["img1"][None].to(device)
+            right = sample["img2"][None].to(device)
+            padder = InputPadder(left.shape, divis_by=32)
+            left, right = padder.pad(left, right)
+            predictions = model(left, right, iters=iters,
+                                scale_iters=scale_iters, test_mode=False)
+            if len(predictions) != iters + 1:
+                raise ValueError(f"Expected d0 + {iters} predictions, got {len(predictions)}")
+            gt = sample["disp"].to(device).squeeze(0)
+            valid = (sample["valid"].to(device).squeeze(0) >= 0.5)
+            valid &= torch.isfinite(gt) & (gt > 0) & (gt < max_disp)
+            if not valid.any():
+                raise ValueError(f"No valid GT for {left_path}")
+            estimate = torch.stack([padder.unpad(pred).squeeze() for pred in predictions])
+            if estimate.shape[1:] != gt.shape:
+                raise ValueError(f"Prediction shape mismatch for {left_path}")
+            if not torch.isfinite(estimate[:, valid]).all():
+                raise ValueError(f"Nonfinite prediction for {left_path}")
+            error = (estimate.float() - gt.float().unsqueeze(0)).abs()
+            masks = {"0-768": valid}
+            masks.update({label: valid & (gt >= lower) & (gt < upper)
+                          for lower, upper, label in REFINE_BUCKETS})
+            buckets = {label: {"pixels": int(mask.sum().item()),
+                               "error_sums": error[:, mask].sum(dim=1).double().cpu().tolist()}
+                       for label, mask in masks.items()}
+            if sum(buckets[label]["pixels"] for _, _, label in REFINE_BUCKETS) != buckets["0-768"]["pixels"]:
+                raise ValueError(f"Bucket counts do not partition GT for {left_path}")
+            row = {"left": left_path, "buckets": buckets}
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("a") as output:
+                output.write(json.dumps(row) + "\n")
+                output.flush()
+            completed[left_path] = row
+            del predictions, estimate, error
+        print(f"{name}: {len(indices)} refine-curve images complete", flush=True)
+
 
 class UnrealStereo4K(datasets.StereoDataset):
     def __init__(self, root, scene="00008"):
@@ -115,6 +178,11 @@ def validate_mixed(model, names, roots, manifests, iters=32, scale_iters=8,
     from core.corga.defom_cor_ga import autocast
 
     model.eval()
+    refine_curve_path = os.environ.get("MIXED_REFINE_CURVE_JSONL")
+    if refine_curve_path:
+        return validate_refine_curve(model, names, roots, manifests, iters,
+                                     scale_iters, max_disp, max_samples,
+                                     refine_curve_path)
     device = next(model.parameters()).device
     results = {}
     total_error, total_bad, total_pixels = 0.0, 0, 0

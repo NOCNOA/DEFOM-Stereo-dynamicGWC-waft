@@ -17,31 +17,27 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from utils.utils import *
-from core.bin.defom_cor_ga_bins2 import DEFOMStereo as CorGABinsNoRoPEStereo
-from core.bin.defom_cor_ga_bins3 import DEFOMStereo as CorGABinsSmoothInitEdgeStereo
-from core.bin.defom_cor_ga_bins3_gwc import DEFOMStereo as CorGABins3GWCStereo
-from core.bin.defom_cor_ga_bins4 import DEFOMStereo as CorGABinsAttentionStereo
-from core.bin.defom_cor_ga_bins5 import DEFOMStereo as CorGABins5Stereo
-from core.bin.defom_cor_ga_bins5_shared_parallel import DEFOMStereo as CorGABins5SharedParallelStereo
-from core.bin.defom_cor_ga_bins6 import DEFOMStereo as CorGABins6Stereo
-from core.bin.defom_cor_ga_bins_residual import DEFOMStereo as CorGABinsResidualStereo
 from core.corga.defom_cor_ga import DEFOMStereo as CorGAStereo
+from core.corga.defom_cor_ga_match import DEFOMStereo as CorGAMatchStereo
 from core.corga.defom_cor_ga_coarse1 import DEFOMStereo as CorGACoarse1Stereo
 from core.corga.defom_cor_ga_lite import DEFOMStereo as CorGALiteStereo
 from core.corga.defom_cor_ga_fast import DEFOMStereo as CorGAFastStereo
 from core.corga.defom_cor_ga_fast2 import DEFOMStereo as CorGAFast2Stereo
+from core.corga.defom_cor_ga_fast2_two_branch import DEFOMStereo as CorGAFast2TwoBranchStereo
+from core.corga.defom_cor_ga_fast2_match import DEFOMStereo as CorGAFast2MatchStereo
 from core.corga.defom_cor_ga_fast3 import DEFOMStereo as CorGAFast3Stereo
 from core.corga.defom_cor_ga_no_mono_head import DEFOMStereo as CorGANoMonoHeadStereo
 from core.corga.defom_cor_ga_no_mono_igev import DEFOMStereo as CorGANoMonoIGEVStereo
 from core.corga.defom_cor_ga_stereo_igev import DEFOMStereo as CorGAStereoIGEVStereo
-from core.corga.defom_cor_ga_stereo_igevpp_encoder import DEFOMStereo as CorGAStereoIGEVPPEncoderStereo
-from core.corga.defom_cor_ga_stereo_igevpp_encoder_coarse_corr_only import DEFOMStereo as CorGAStereoIGEVPPEncoderCoarseCorrOnlyStereo
 from core.corga.defom_cor_ga_fast_pairres import DEFOMStereo as CorGAFastPairResidualStereo
 from core.corga.defom_cor_ga_fast_bininit import DEFOMStereo as CorGAFastBinInitStereo
 from core.corga.defom_cor_ga_fast_binmono import DEFOMStereo as CorGAFastBinMonoStereo
 from core.corga.defom_cor_ga_fast_binmono_corrstats import DEFOMStereo as CorGAFastBinMonoCorrStatsStereo
 from core.corga.defom_cor_ga_noh import DEFOMStereo as CorGANoHiddenStereo
 from core.bin.defom_cor_ga_bins import DEFOMStereo as CorGABinsStereo
+from core.bin.defom_cor_ga_bins_wavelet import DEFOMStereo as CorGABinsWaveletStereo
+from core.bin.defom_cor_ga_bins_match8 import DEFOMStereo as CorGABinsMatch8Stereo
+from core.bin.defom_cor_ga_bins_match8_spatial import DEFOMStereo as CorGABinsMatch8SpatialStereo
 #from core.defom_GRU_2multi import DEFOMStereo
 #from core.defom_onlygwc import DEFOMStereo
 #from core.defom_pru import DEFOMStereo
@@ -163,35 +159,6 @@ def train(args):
         raise ValueError("resume_lr_scale must be positive")
     if args.stop_after_step < 0 or (args.stop_after_step and args.stop_after_step > args.num_steps):
         raise ValueError("stop_after_step must be between 0 and num_steps")
-    if args.freeze_stereo_encoder and (
-        args.model_arch != 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'
-        or not args.resume_ckpt
-    ):
-        raise ValueError(
-            "--freeze_stereo_encoder requires the coarse-corr-only model "
-            "and a full resume checkpoint"
-        )
-    if args.freeze_coarse_gru_motion and (
-        args.model_arch != 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'
-        or not args.resume_ckpt
-    ):
-        raise ValueError(
-            "--freeze_coarse_gru_motion requires the coarse-corr-only model "
-            "and a full resume checkpoint"
-        )
-    if (
-        args.freeze_refine_update_projection
-        or args.freeze_refine_update
-        or args.freeze_refine_projection
-        or args.freeze_refine_component
-    ) and (
-        args.model_arch != 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'
-        or not args.resume_ckpt
-    ):
-        raise ValueError(
-            "Refine freeze options require the coarse-corr-only model "
-            "and a full resume checkpoint"
-        )
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     args.distributed = world_size > 1
     args.local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
@@ -238,55 +205,27 @@ def train(args):
         'cor_ga_coarse1': CorGACoarse1Stereo,
         'cor_ga_lite': CorGALiteStereo,
         'cor_ga': CorGAStereo,
+        'cor_ga_match': CorGAMatchStereo,
         'cor_ga_fast': CorGAFastStereo,
         'cor_ga_fast2': CorGAFast2Stereo,
+        'cor_ga_fast2_two_branch': CorGAFast2TwoBranchStereo,
+        'cor_ga_fast2_match': CorGAFast2MatchStereo,
         'cor_ga_fast3': CorGAFast3Stereo,
         'cor_ga_no_mono_head': CorGANoMonoHeadStereo,
         'cor_ga_no_mono_igev': CorGANoMonoIGEVStereo,
         'cor_ga_stereo_igev': CorGAStereoIGEVStereo,
-        'cor_ga_stereo_igevpp_encoder': CorGAStereoIGEVPPEncoderStereo,
-        'cor_ga_stereo_igevpp_encoder_coarse_corr_only': CorGAStereoIGEVPPEncoderCoarseCorrOnlyStereo,
         'cor_ga_fast_pairres': CorGAFastPairResidualStereo,
         'cor_ga_fast_bininit': CorGAFastBinInitStereo,
         'cor_ga_fast_binmono': CorGAFastBinMonoStereo,
         'cor_ga_fast_binmono_corrstats': CorGAFastBinMonoCorrStatsStereo,
         'cor_ga_noh': CorGANoHiddenStereo,
         'cor_ga_bins': CorGABinsStereo,
-        'cor_ga_bins2': CorGABinsNoRoPEStereo,
-        'cor_ga_bins3': CorGABinsSmoothInitEdgeStereo,
-        'cor_ga_bins3_gwc': CorGABins3GWCStereo,
-        'cor_ga_bins4': CorGABinsAttentionStereo,
-        'cor_ga_bins5': CorGABins5Stereo,
-        'cor_ga_bins5_shared_parallel': CorGABins5SharedParallelStereo,
-        'cor_ga_bins6': CorGABins6Stereo,
-        'cor_ga_bins_residual': CorGABinsResidualStereo,
+        'cor_ga_bins_wavelet': CorGABinsWaveletStereo,
+        'cor_ga_bins_match8': CorGABinsMatch8Stereo,
+        'cor_ga_bins_match8_spatial': CorGABinsMatch8SpatialStereo,
     }
     model_class = model_classes[args.model_arch]
     model = model_class(args).to(device)
-    if args.freeze_stereo_encoder:
-        for parameter in model.stereo_encoder.parameters():
-            parameter.requires_grad_(False)
-        if is_main_process:
-            logging.info('Frozen stereo_encoder for the resumed control experiment')
-    if args.freeze_coarse_gru_motion:
-        for block in model.coarse_update_blocks:
-            block.gru_layers.requires_grad_(False)
-            block.motion_encoder.requires_grad_(False)
-        if is_main_process:
-            logging.info('Frozen coarse GRU layers and motion encoders for the resumed control experiment')
-    if args.freeze_refine_update_projection or args.freeze_refine_update:
-        model.refine_update_block.requires_grad_(False)
-        if is_main_process:
-            logging.info('Frozen refine update block for the resumed control experiment')
-    if args.freeze_refine_update_projection or args.freeze_refine_projection:
-        model.refine_state_projections.requires_grad_(False)
-        if is_main_process:
-            logging.info('Frozen refine state projections for the resumed control experiment')
-    if args.freeze_refine_component:
-        component = getattr(model.refine_update_block, args.freeze_refine_component)
-        component.requires_grad_(False)
-        if is_main_process:
-            logging.info('Frozen refine update component %s for the resumed control experiment', args.freeze_refine_component)
     print("Parameter Count: %d, Trainable: %d" % count_parameters(model))
 
     if args.distributed:
@@ -295,7 +234,7 @@ def train(args):
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
-            find_unused_parameters=args.model_arch not in ('cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only'))
+            find_unused_parameters=True)
         model_without_ddp = model.module
     else:
         if torch.cuda.device_count() > 1:
@@ -429,7 +368,7 @@ def train(args):
                 assert model.training
                 if 'init_disps' in aux:
                     init_bins = model_without_ddp.bin_initializer.bin_disparities
-                    main_loss, metrics = (sequence_loss_multi_init_smooth_l1_edge if args.model_arch in ('cor_ga_bins3', 'cor_ga_bins3_gwc') else sequence_loss_multi_init_waft)(
+                    main_loss, metrics = sequence_loss_multi_init_waft(
                         aux['init_disps'],
                         aux['init_logits'],
                         aux['w_h_logits'],
@@ -462,13 +401,10 @@ def train(args):
                                 'bin_loss_mode': 'smooth_l1',
                                 'bin_disp_smooth_l1_weight': args.bin_disp_smooth_l1_weight,
                             }
-                            if (
-                                args.model_arch in ('cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only')
-                                or (args.model_arch == 'cor_ga_no_mono_igev' and args.bin_loss_mode == 'smooth_l1')
-                            ) else {}
+                            if (args.model_arch == 'cor_ga_no_mono_igev' and args.bin_loss_mode == 'smooth_l1') else {}
                         ),
                     )
-                    if args.model_arch in ('cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_fast_bininit', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only', 'cor_ga_fast_binmono', 'cor_ga_fast_binmono_corrstats'):
+                    if args.model_arch in ('cor_ga_fast_bininit', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_fast_binmono', 'cor_ga_fast_binmono_corrstats'):
                         coarse_valid_masks = coarse_branch_valid_masks(
                             init_bins,
                             aux['init_valid'],
@@ -568,45 +504,21 @@ def train(args):
                     reported_grad_stride_mismatch = True
 
             scaler.unscale_(optimizer)
-            if is_main_process and args.diagnostic_grad_freq > 0 and total_steps % args.diagnostic_grad_freq == 0:
-                diagnostic_modules = {
-                    'bin_initializer': model_without_ddp.bin_initializer,
-                    'coarse_0': model_without_ddp.coarse_update_blocks[0],
-                    'coarse_1': model_without_ddp.coarse_update_blocks[1],
-                    'coarse_2': model_without_ddp.coarse_update_blocks[2],
-                    'refine': model_without_ddp.refine_update_block,
-                    'refine_state_projections': model_without_ddp.refine_state_projections,
-                    'stereo_encoder': model_without_ddp.stereo_encoder,
-                    'context_encoder': model_without_ddp.cnet,
-                    'gate': model_without_ddp.hypothesis_weight_head,
-                }
-                for module_name, module in diagnostic_modules.items():
-                    module_grad_norm = clip_grad_norm_stable(module.parameters(), float('inf'))
-                    logger.writer.add_scalar(f'diagnostic/grad_norm/{module_name}',
-                                             module_grad_norm.detach().item(), total_steps)
-                for parameter_name in (
-                    'refine_update_block.mask.0.weight',
-                    'refine_state_projections.0.weight',
-                ):
-                    parameter = model_without_ddp.get_parameter(parameter_name)
-                    logger.writer.add_scalar(f'diagnostic/param_norm/{parameter_name}',
-                                             parameter.detach().float().norm().item(), total_steps)
             stable_clip_architectures = (
                 'cor_ga',
+                'cor_ga_match',
                 'cor_ga_fast',
                 'cor_ga_fast2',
+                'cor_ga_fast2_two_branch',
+                'cor_ga_fast2_match',
                 'cor_ga_fast3',
                 'cor_ga_no_mono_head',
                 'cor_ga_no_mono_igev',
                 'cor_ga_stereo_igev',
-                'cor_ga_stereo_igevpp_encoder',
-                'cor_ga_stereo_igevpp_encoder_coarse_corr_only',
                 'cor_ga_fast_pairres',
                 'cor_ga_fast_bininit',
                 'cor_ga_fast_binmono',
                 'cor_ga_fast_binmono_corrstats',
-                'cor_ga_bins5',
-                'cor_ga_bins5_shared_parallel',
                 'cor_ga_noh',
                 'cor_ga_coarse1',
                 'cor_ga_lite',
@@ -791,7 +703,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='defom-stereo', help="name your experiment")
-    parser.add_argument('--model_arch', default='cor_ga_bins2', choices=['cor_ga_fast_binmono_corrstats', 'cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_stereo_igevpp_encoder', 'cor_ga_stereo_igevpp_encoder_coarse_corr_only', 'cor_ga_fast3', 'cor_ga_fast2', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins2', 'cor_ga_bins3', 'cor_ga_bins3_gwc', 'cor_ga_bins4', 'cor_ga_bins5', 'cor_ga_bins5_shared_parallel', 'cor_ga_bins6', 'cor_ga_bins_residual'], help='model architecture')
+    parser.add_argument('--model_arch', default='cor_ga_bins', choices=['cor_ga_match', 'cor_ga_fast_binmono_corrstats', 'cor_ga_fast_binmono', 'cor_ga_fast_bininit', 'cor_ga_fast_pairres', 'cor_ga_no_mono_head', 'cor_ga_no_mono_igev', 'cor_ga_stereo_igev', 'cor_ga_fast3', 'cor_ga_fast2_two_branch', 'cor_ga_fast2', 'cor_ga_fast2_match', 'cor_ga_fast', 'cor_ga', 'cor_ga_coarse1', 'cor_ga_lite', 'cor_ga_noh', 'cor_ga_bins', 'cor_ga_bins_wavelet', 'cor_ga_bins_match8', 'cor_ga_bins_match8_spatial'], help='model architecture')
 
     # resume pretrained model or resume training
     parser.add_argument('--resume_ckpt', default=None, type=str,
@@ -801,24 +713,6 @@ if __name__ == '__main__':
     parser.add_argument('--no_resume_optimizer', action='store_true')
     parser.add_argument('--resume_batch_skip', default=0, type=int,
                         help='replay and skip this many batches in the first resumed epoch')
-    parser.add_argument('--freeze_stereo_encoder', action='store_true',
-                        help='freeze the stereo matching encoder in a coarse-corr-only full-checkpoint resume')
-    parser.add_argument('--freeze_coarse_gru_motion', action='store_true',
-                        help='freeze coarse GRU layers and motion encoders in a coarse-corr-only full-checkpoint resume')
-    parser.add_argument('--freeze_refine_update_projection', action='store_true',
-                        help='freeze refine update block and state projections in a coarse-corr-only full-checkpoint resume')
-    parser.add_argument('--freeze_refine_update', action='store_true',
-                        help='freeze only the refine update block in a coarse-corr-only full-checkpoint resume')
-    parser.add_argument('--freeze_refine_projection', action='store_true',
-                        help='freeze only the refine state projections in a coarse-corr-only full-checkpoint resume')
-    parser.add_argument('--freeze_refine_component', default='',
-                        choices=['', 'motion_encoder', 'gru_layers', 'context_encoders', 'disp_head', 'mask'],
-                        help='freeze one refine update submodule in a coarse-corr-only full-checkpoint resume')
-    parser.add_argument('--match_encoder', default='igevpp', choices=['igevpp', 'dinov2'],
-                        help='image matching encoder for the controlled encoder A/B')
-    parser.add_argument('--paired_encoder_init', action='store_true',
-                        help='restore CPU RNG after building the image encoder so shared downstream weights start identically')
-
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
@@ -850,8 +744,6 @@ if __name__ == '__main__':
     parser.add_argument('--save_latest_ckpt_freq', default=1000, type=int)
     parser.add_argument('--resume_lr_scale', default=1.0, type=float,
                         help='multiply the restored optimizer and OneCycleLR schedule by this factor')
-    parser.add_argument('--diagnostic_grad_freq', default=0, type=int,
-                        help='log per-module pre-clip gradient norms at this optimizer-step interval; 0 disables')
     parser.add_argument('--archive_full_ckpt_freq', default=0, type=int,
                         help='retain a full model/optimizer/scheduler checkpoint at this step interval; 0 disables archival')
     parser.add_argument('--archive_full_ckpt_start_step', default=0, type=int,
@@ -871,27 +763,38 @@ if __name__ == '__main__':
 
     # Raft Architecure choices
     parser.add_argument('--dinov2_encoder', type=str, default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
-    parser.add_argument('--hypothesis_scales', type=float, nargs=3, default=[24.0, 48.0, 96.0],
-                        help='three quarter-resolution scales applied to normalized monocular inverse depth; ignored by bin-initialized models')
+    parser.add_argument('--hypothesis_scales', type=float, nargs='+', default=[24.0, 48.0, 96.0],
+                        help='quarter-resolution monocular hypothesis scales: two for cor_ga_fast2_two_branch, three for other mono models; ignored by bin-initialized models')
     parser.add_argument('--num_init_bins', type=int, default=48, help='equal bin count used by all three disparity ranges')
+    parser.add_argument('--match_feature_dim', type=int, default=None, help='left/right low-channel feature width in matching models; defaults to 32 for cor_ga_match and 24 for cor_ga_fast2_match; matching output stays 32')
+    parser.add_argument('--match_groups', type=int, default=4, help='group-wise cosine channels in matching models; must divide match_feature_dim')
+    parser.add_argument('--match_token_grid', choices=['native', 'dense'], default='native',
+                        help='spatial match8 token grid: native scale or dense quarter resolution')
+    parser.add_argument('--match_token_dim', type=int, default=None, help='per-candidate token channels; defaults to 32 for cor_ga_match and 28 for cor_ga_fast2_match; evidence projection is skipped when widths match')
+    parser.add_argument('--disable_activation_checkpoint', action='store_true', help='disable matching and PRU activation checkpointing in cor_ga_match / cor_ga_fast2_match')
+    parser.add_argument('--match_aggregation_layers', type=int, default=1, help='residual candidate Conv1d blocks in cor_ga_match / cor_ga_fast2_match; 0 disables')
+    parser.add_argument('--match_scale_encoding', action='store_true', help='include log2(scale)/2 in cor_ga_match / cor_ga_fast2_match tokens')
+    parser.add_argument('--match_right_compression', choices=['avg', 'conv'], default='conv', help='right-width compressor in cor_ga_match / cor_ga_fast2_match')
     parser.add_argument('--init_max_offset', type=float, default=48.0, help='exclusive upper bound of bin offsets in each compressed right-feature coordinate')
     parser.add_argument('--init_corr_scale', type=float, default=10.0, help='scale applied to cosine matching logits')
-    parser.add_argument('--init_gwc_groups', type=int, default=8, help='channel groups used by cor_ga_bins3_gwc initialization')
     parser.add_argument('--freeze_bininit_base', action='store_true', help='train only the new bin initializer/compressor in cor_ga_fast_bininit or cor_ga_no_mono_head')
     parser.add_argument('--freeze_binmono_base', action='store_true', help='train only the shared bin/mono confidence head in cor_ga_fast_binmono')
     parser.add_argument('--binmono_conf_hidden', type=int, default=32, help='hidden channels in the shared bin/mono confidence head')
     parser.add_argument('--binmono_init_stereo_weight', type=float, default=0.05, help='initial stereo-bin weight used by cor_ga_fast_binmono')
     parser.add_argument('--corr_stats_hidden', type=int, default=32, help='hidden channels in the refine correlation-statistics residual adapter')
     parser.add_argument('--corr_stats_temperature', type=float, default=1.0, help='softmax temperature after local correlation standardization')
-    parser.add_argument('--init_gwc_hidden', type=int, default=32, help='hidden width of the shared per-bin GWC detector')
     parser.add_argument('--init_right_compression', choices=['avg', 'conv'], default='avg',
                         help='right-feature width compression used by cor_ga_bins bin matching')
+    parser.add_argument('--top8_guidance_mode', choices=['fused', 'samples'], default='fused',
+                        help='query global candidates with fused features or individual local samples')
+    parser.add_argument('--enable_top8_guidance', action='store_true',
+                        help='read coarse-bin Top8 matching tokens to guide cor_ga_bins local warp features')
     parser.add_argument('--refine_right_compression', choices=['avg', 'conv'], default='avg',
                         help='right-feature width compression used by cor_ga_bins GRU warp lookup')
     parser.add_argument('--loss_gamma', type=float, default=0.9, help='decay factor for successive recurrent L1 losses')
     parser.add_argument('--init_target_temperature', type=float, default=1.0, help='WAFT target temperature in full-resolution disparity pixels')
     parser.add_argument('--bin_disp_smooth_l1_weight', type=float, default=0.2,
-                        help='weight for per-branch Smooth L1 supervision of raw bin disparity in cor_ga_stereo_igevpp_encoder')
+                        help='weight for optional per-branch Smooth L1 supervision of raw bin disparity')
     parser.add_argument('--bin_loss_mode', choices=['soft_ce', 'smooth_l1'], default='soft_ce',
                         help='bin supervision mode for cor_ga_no_mono_igev; other architectures retain their existing behavior')
     parser.add_argument('--gate_loss_weight', type=float, default=0.1, help='weight of direct hypothesis-gate soft cross-entropy')
@@ -901,7 +804,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_gru_edge_loss', action='store_true', help='apply GT-disparity edge weighting only to recurrent GRU predictions')
     parser.add_argument('--edge_mode', choices=['topk', 'threshold'], default='topk', help='method used to select GT disparity edges')
     parser.add_argument('--edge_topk', type=float, default=0.10, help='per-image fraction of strongest valid GT gradients selected in topk mode')
-    parser.add_argument('--init_branch_loss_weight', type=float, default=0.1, help='bins3 weight for summed per-branch initial-disparity SmoothL1 losses')
+    parser.add_argument('--init_branch_loss_weight', type=float, default=0.1, help='optional per-branch initial-disparity SmoothL1 weight')
     parser.add_argument('--edge_threshold', type=float, default=1.0, help='GT disparity-gradient threshold in pixels for threshold mode')
     parser.add_argument('--edge_dilation', type=int, default=5, help='edge-mask dilation kernel size in full-resolution pixels')
     parser.add_argument('--gru_edge_lambda', type=float, default=1.0, help='extra recurrent L1 weight assigned to selected edge pixels')

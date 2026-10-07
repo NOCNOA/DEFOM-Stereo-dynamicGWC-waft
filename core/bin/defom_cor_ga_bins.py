@@ -8,6 +8,8 @@ from core.extractor import BasicEncoder, BasicEncoder2, DefomEncoder
 from core.galerkin import simple_attn_rope_2d
 from core.submodules import ParallelRightWidthCompressor, lookup_right_features
 from core.utils.utils import coords_grid, upflow, get_danv2_io_size
+from core.bin.top8_guidance import CoarseTop8Guidance
+from core.bin.top8_sample_guidance import SampleTop8Guidance
 
 
 try:
@@ -27,14 +29,12 @@ except Exception:
 class MultiRangeBinInitializer(nn.Module):
     """Estimate three initial disparities with equal-width bins over 1/2/4x ranges."""
 
-    def __init__(self, feature_dim=32, num_bins=48, max_offset=48.0, corr_scale=10.0):
+    def __init__(self, feature_dim=32, num_bins=48, max_offset=48.0,
+                 corr_scale=10.0, use_mono=True):
         super().__init__()
-        if num_bins < 2:
-            raise ValueError(f"num_bins must be at least 2, got {num_bins}")
-        if max_offset <= 0:
-            raise ValueError(f"max_offset must be positive, got {max_offset}")
         self.num_bins = int(num_bins)
         self.corr_scale = float(corr_scale)
+        self.use_mono = bool(use_mono)
         self.compression_ratios = (1, 2, 4)
         bin_width = float(max_offset) / self.num_bins
         offsets = torch.arange(self.num_bins, dtype=torch.float32) * bin_width
@@ -42,7 +42,8 @@ class MultiRangeBinInitializer(nn.Module):
         self.bin_width = bin_width
         self.register_buffer('bin_offsets', offsets, persistent=False)
         self.register_buffer('bin_disparities', ratios[:, None] * offsets[None, :], persistent=False)
-        self.logit_refiners = nn.ModuleList([nn.Sequential(nn.Conv2d(self.num_bins + 1, feature_dim, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(feature_dim, self.num_bins, 3, padding=1)) for _ in self.compression_ratios])
+        refiner_channels = self.num_bins + int(self.use_mono)
+        self.logit_refiners = nn.ModuleList([nn.Sequential(nn.Conv2d(refiner_channels, feature_dim, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(feature_dim, self.num_bins, 3, padding=1)) for _ in self.compression_ratios])
         for refiner in self.logit_refiners:
             nn.init.zeros_(refiner[-1].weight)
             nn.init.zeros_(refiner[-1].bias)
@@ -80,11 +81,14 @@ class MultiRangeBinInitializer(nn.Module):
             logits = ((1.0 - alpha) * value0 + alpha * value1).permute(0, 3, 1, 2).contiguous()
         return logits, valid.permute(0, 3, 1, 2).expand(batch, self.num_bins, height, width)
 
-    def forward(self, left_feature, right_feature_pyramid, mono_idepth):
+    def forward(self, left_feature, right_feature_pyramid, mono_idepth=None):
         if len(right_feature_pyramid) != len(self.compression_ratios):
             raise ValueError(f"Expected {len(self.compression_ratios)} right features, got {len(right_feature_pyramid)}")
         self._require_finite("left_feature", left_feature)
-        self._require_finite("mono_idepth", mono_idepth)
+        if self.use_mono:
+            if mono_idepth is None:
+                raise ValueError("mono_idepth is required when use_mono=True")
+            self._require_finite("mono_idepth", mono_idepth)
         branch_logits = []
         branch_confidences = []
         branch_disps = []
@@ -97,7 +101,10 @@ class MultiRangeBinInitializer(nn.Module):
                 self._require_finite("right_feature", right_feature, branch_index)
                 raw_logits, valid = self._match_logits(left_feature, right_feature, ratio)
                 self._require_finite("raw_logits", raw_logits, branch_index)
-                refiner_input = torch.cat([raw_logits.masked_fill(~valid, -1.0), mono_idepth.float()], dim=1)
+                refiner_inputs = [raw_logits.masked_fill(~valid, -1.0)]
+                if self.use_mono:
+                    refiner_inputs.append(mono_idepth.float())
+                refiner_input = torch.cat(refiner_inputs, dim=1)
                 refiner_delta = self.logit_refiners[branch_index](refiner_input.float())
                 self._require_finite("refiner_delta", refiner_delta, branch_index)
                 logits = self.corr_scale * raw_logits + refiner_delta
@@ -129,7 +136,7 @@ class DEFOMStereo(nn.Module):
     7. 新增 initial_weight_head，根据上下文、左特征、单目深度、初始视差和置信度预测融合权重。
     8. 分别预测三组初始视差的融合权重 w_h，以及递归 warp 特征的尺度权重 w_s。
     9. 直接使用原始 context hidden states 初始化 refinement GRU，不再融合三个 coarse hidden states。
-    10. 使用 tanh 将每次递归视差更新平滑限制在 max_delta_disp 范围内。
+    10. 直接使用递归视差增量，不对 delta disparity 做 tanh 限幅。
     11. 冻结因移除 coarse 分支而不再参与前向计算的结构性冗余参数。
     12. 额外返回 bin logits、有效掩码、分支初始视差和 gate logits，供 WAFT 风格监督使用。
     13. 将递归更新块保持在 FP32，避免 18 轮 hidden-state 传播中的偶发 FP16 前向溢出。
@@ -183,10 +190,25 @@ class DEFOMStereo(nn.Module):
                 mode=self.refine_right_compression,
             )
         self.bin_initializer = MultiRangeBinInitializer(feature_dim=32, num_bins=getattr(args, 'num_init_bins', 48), max_offset=getattr(args, 'init_max_offset', 48.0), corr_scale=getattr(args, 'init_corr_scale', 10.0))
+        if getattr(args, 'enable_top8_guidance', False):
+            # Adding the head must not shift the baseline initialization/RNG.
+            rng_state = torch.get_rng_state()
+            try:
+                self.top8_guidance_mode = getattr(args, 'top8_guidance_mode', 'fused')
+                guidance_class = SampleTop8Guidance if self.top8_guidance_mode == 'samples' else CoarseTop8Guidance
+                extra = dict(samples_per_scale=window_size) if self.top8_guidance_mode == 'samples' else {}
+                self.top8_guidance = guidance_class(
+                    feature_dim=low_feature_dim,
+                    pixel_factor=2 ** args.n_downsample,
+                    max_disp=float(getattr(args, 'train_max_disp', 768.)) / (2 ** args.n_downsample), **extra)
+                if self.top8_guidance_mode == 'samples':
+                    projection = nn.Conv2d(low_feature_dim, hidden_dim // 2, 1)
+                    nn.init.zeros_(projection.weight)
+                    nn.init.zeros_(projection.bias)
+                    self.refine_update_block.motion_encoder.global_convg1 = projection
+            finally:
+                torch.set_rng_state(rng_state)
         self.num_init_ranges = len(self.bin_initializer.compression_ratios)
-        self.max_delta_disp = float(getattr(args, 'max_delta_disp', 8.0))
-        if self.max_delta_disp <= 0:
-            raise ValueError(f"max_delta_disp must be positive, got {self.max_delta_disp}")
         hidden_dim = args.hidden_dims[0]
         aggregation_channels = hidden_dim + 32 + 1 + 2 * self.num_init_ranges
         self.initial_weight_head = nn.Sequential(nn.Conv2d(aggregation_channels, hidden_dim, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(hidden_dim, 2 * self.num_init_ranges, 1))
@@ -231,8 +253,34 @@ class DEFOMStereo(nn.Module):
         volume = CorrBlock1D1.corr(fmap1.float(), fmap2.float())
         return CorrBlock1D1(volume, coords, num_levels=self.corr_levels, radius=self.corr_radius, coordinate_mode='right', volume_layout='full_corr')
 
-    def _refine_warp_feature(self, fmap1_low, right_feature_pyramid, disp, scale_weights):
-        return lookup_right_features(fmap1_low, right_feature_pyramid, disp, warp_offsets=self.warp_offsets, feature_fuse=self.refine_right_fuse, rope_galerkin=self.refine_rope, scale_weights=scale_weights, compression_ratios=(1, 2, 4))
+    def _refine_warp_feature(self, fmap1_low, right_feature_pyramid, disp, scale_weights,
+                             global_evidence=None, sample_evidence=None, enhanced=None,
+                             rope_positions=None):
+        conditioner = None
+        if sample_evidence is not None:
+            if global_evidence is not None:
+                raise ValueError('Sample Top8 and wavelet conditioning cannot be combined')
+            def conditioner(left, sampled):
+                enhanced['feature'] = self.top8_guidance.condition_samples(
+                    sample_evidence, left, sampled, disp, self.warp_offsets,
+                    tuple(feature.shape[-1] for feature in right_feature_pyramid))
+                return sampled, None
+        if global_evidence is not None:
+            right_widths = tuple(feature.shape[-1] for feature in right_feature_pyramid)
+
+            def conditioner(left, sampled):
+                return self.wavelet_guidance.condition_samples(
+                    global_evidence, left, sampled, disp, self.warp_offsets,
+                    scale_weights, right_widths)
+
+        return lookup_right_features(
+            fmap1_low, right_feature_pyramid, disp,
+            warp_offsets=self.warp_offsets, feature_fuse=self.refine_right_fuse,
+            rope_galerkin=(self.refine_rope if rope_positions is None else
+                           lambda feature: self.refine_rope(feature, freqs_cis=rope_positions)),
+            scale_weights=scale_weights,
+            compression_ratios=(1, 2, 4), sample_conditioner=conditioner,
+            compact_sampling=True)
 
     def _freeze_structurally_unused_parameters(self):
         for norm_name in ('norm2', 'norm3'):
@@ -243,9 +291,6 @@ class DEFOMStereo(nn.Module):
         unused_depth_residual = self.defomencoder.depth_anything.depth_feat.scratch.refinenet4.resConfUnit1
         for parameter in unused_depth_residual.parameters():
             parameter.requires_grad = False
-
-    def _limit_delta_disparity(self, delta_disp):
-        return self.max_delta_disp * torch.tanh(delta_disp.float() / self.max_delta_disp)
 
     def _debug_require_finite(self, name, tensor, iteration):
         if getattr(self.args, 'debug_nan', False):
@@ -290,6 +335,9 @@ class DEFOMStereo(nn.Module):
                 init_right_feature_pyramid,
                 mono_idepth1_4,
             )
+            global_evidence = (
+                self.wavelet_guidance.compress(init_logits, init_valid)
+                if hasattr(self, 'wavelet_guidance') else None)
             init_disps = [self._bound_disparity(disp) for disp in init_disps]
             aggregation_input = torch.cat([inp_4, fmap1_low, mono_idepth1_4.float()] + init_disps + [init_confidence], dim=1)
             weight_logits = self.initial_weight_head(aggregation_input)
@@ -309,10 +357,22 @@ class DEFOMStereo(nn.Module):
         del image1, image2, dfeat1_4, dfeat2_4, fmap1_4, fmap2_4, context_pyramid, net_4, aggregation_input, weight_logits
 
         d0 = disp
+        top8_evidence = None
+        if hasattr(self, 'top8_guidance') and iters > 0:
+            with autocast(enabled=False):
+                top8_evidence = self.top8_guidance.build(
+                    fmap1_low.float(), init_right_feature_pyramid[2].float(),
+                    init_logits[:, 2].float(), init_valid[:, 2],
+                    self.bin_initializer.bin_disparities[2], ratio=4)
         disp_predictions = [upflow(d0, factor=2 ** self.args.n_downsample)]
         disp_up = disp_predictions[0]
+        # Cache only within this forward: frequencies are trainable and must
+        # retain their autograd graph across all refinement iterations.
+        refine_positions = self.refine_rope.prepare_positions(fmap1_low) if iters > 0 else None
         for iteration in range(iters):
             disp = disp.detach()
+            enhanced = {}
+            sample_evidence = top8_evidence if getattr(self, 'top8_guidance_mode', 'fused') == 'samples' else None
             with autocast(enabled=self.args.mixed_precision):
                 corr = full_corr(disp)
                 warp_feature = self._refine_warp_feature(
@@ -320,19 +380,27 @@ class DEFOMStereo(nn.Module):
                     refine_right_feature_pyramid,
                     disp,
                     scale_weights,
+                    global_evidence,
+                    sample_evidence=sample_evidence, enhanced=enhanced,
+                    rope_positions=refine_positions,
                 )
             self._debug_require_finite("corr", corr, iteration)
             self._debug_require_finite("warp_feature", warp_feature, iteration)
             with autocast(enabled=False):
+                if top8_evidence is not None and sample_evidence is None:
+                    warp_feature = self.top8_guidance(
+                        top8_evidence, fmap1_low.float(), warp_feature.float(), disp.float())
                 refine_nets, delta_disp, up_mask = self.refine_update_block(
                     refine_nets, corr.float(), disp.float(), inp_4,
-                    warp_feature.float(), d0.float())
+                    warp_feature.float(), d0.float(),
+                    need_mask=not test_mode or iteration == iters - 1,
+                    global_warp_feat=enhanced['feature'].float() if enhanced else None)
             for state_index, state in enumerate(refine_nets):
                 self._debug_require_finite(f"hidden[{state_index}]", state, iteration)
             self._debug_require_finite("delta_disp", delta_disp, iteration)
-            self._debug_require_finite("up_mask", up_mask, iteration)
-            delta_disp = self._limit_delta_disparity(delta_disp)
-            disp = self._bound_disparity(disp + delta_disp)
+            if up_mask is not None:
+                self._debug_require_finite("up_mask", up_mask, iteration)
+            disp = self._bound_disparity(disp + delta_disp.float())
             self._debug_require_finite("disp", disp, iteration)
             if test_mode and iteration < iters - 1:
                 continue

@@ -231,26 +231,48 @@ CorGA and bin experiments are grouped by model family:
 | Family | Models | Scripts | nohup logs |
 | --- | --- | --- | --- |
 | CorGA | `core/corga/` | `scripts/corga/` | `nohups/corga/` |
-| Bin | `core/bin/` | `scripts/bin/` | `nohups/bin/` |
+| Bin (`cor_ga_bins` only) | `core/bin/defom_cor_ga_bins.py` | `scripts/bin/` | `nohups/bin/` |
 
 `fast_bininit` and `fast_binmono` remain in CorGA because they extend the
-CorGA-fast architecture; `defom_cor_ga_bins*` models form the bin series.
+CorGA-fast architecture; `defom_cor_ga_bins.py` is the retained bin model.
 Older GWC-only logs are in `nohups/other/`. Shared model components and
 general-purpose scripts remain in `core/` and `scripts/`.
 
-For example, launch the IGEV++ CorGA experiment from the repository root with:
+The standalone `cor_ga_match` model adds local matching tokens and candidate
+aggregation to CorGA's coarse and refinement paths. See [CORGA_MATCH.md](CORGA_MATCH.md)
+for architecture details, training/evaluation scripts and ablation options.
+`cor_ga_fast2_match` preserves those matching tokens and adds fast2 horizontal
+sampling, batched coarse lookup and execution caches. Its left/right feature
+projection defaults to 24 channels and candidate tokens to 28. The aggregated
+28-channel window is concatenated with the left feature and fused directly
+from 52 to 32 channels for RoPE and PRU. The changed matching layers need a
+new training experiment; see [CORGA_MATCH.md](CORGA_MATCH.md).
+
+To fine-tune `core/corga/defom_cor_ga_fast2.py` without the per-update
+`tanh` limit in either coarse or refinement:
 
 ```bash
-EXPERIMENT_NAME=defomstereo_corga_igevpp_encoder_new \
-  nohup setsid bash scripts/corga/train_sceneflow_corga_igevpp_encoder.sh fresh \
-  >> nohups/corga/corga_igevpp_encoder_new.out 2>&1 < /dev/null &
+bash scripts/corga/finetune_sceneflow_vitl_corga_fast2_no_delta_clamp.sh fresh
+bash scripts/corga/finetune_sceneflow_vitl_corga_fast2_no_delta_clamp.sh resume
+bash scripts/corga/evaluate_sceneflow_vitl_corga_fast2_no_delta_clamp.sh
 ```
 
-The IGEV++ script defaults to `GPU_ID=0,2` and launches one DDP process per
-visible GPU. `GLOBAL_BATCH_SIZE=4` is the default global batch size (2 images
-per GPU with two GPUs). Set `GPU_ID=0,1,2,3 GLOBAL_BATCH_SIZE=8` to use four
-local GPUs with the same per-GPU batch size. A single GPU uses the ordinary
-Python training path.
+The fresh run strictly loads the fast2 scratch 200k weights, resets the
+optimizer and schedule, and fine-tunes for 20k steps at a peak learning rate
+of `2e-5`. Defaults are ViT-L, batch size 2, no gradient accumulation,
+256x768 crops, 6 coarse iterations, 18 refinement iterations and BF16 AMP.
+Validation uses 32 refinement iterations every 5k steps. Resume restores
+the complete fine-tuning state from its separate experiment directory.
+Set `PRETRAINED_CKPT`, `EXPERIMENT_NAME`, `LEARNING_RATE`, `NUM_STEPS`,
+`TRAIN_ITERS`, `BATCH_SIZE`, `NUM_WORKERS`, `VAL_FREQ` or `GPU_ID` as needed;
+both scripts reject GPU 1. Extra Python arguments can follow the mode
+in the training script or follow the evaluation script name.
+
+Both scripts pass `--disable_delta_clamp`. This removes the update limit,
+while retaining the final disparity range of 0–768 full-resolution pixels.
+The flag is a runtime setting and must also be supplied at evaluation;
+it is not encoded in model weights. This experiment uses the original
+fast2 architecture, with its 32-channel left/right features.
 
 ### Finetune for Benchmarks
 

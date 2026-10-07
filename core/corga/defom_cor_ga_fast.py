@@ -56,7 +56,7 @@ class DEFOMStereo(CorGA):
         return outputs
 
     def forward(self, image1, image2, iters=12, scale_iters=3, test_mode=False,
-                return_aux=False, coarse_ablation=None):
+                return_aux=False, coarse_ablation=None, return_hr_state=False):
         # Cover the frozen ViT and small tensor operations that sit outside the
         # narrower autocast regions below. Numerically sensitive FullCorr and
         # disparity accumulation explicitly opt back into FP32.
@@ -64,11 +64,11 @@ class DEFOMStereo(CorGA):
             return self._forward_impl(
                 image1, image2, iters=iters, scale_iters=scale_iters,
                 test_mode=test_mode, return_aux=return_aux,
-                coarse_ablation=coarse_ablation)
+                coarse_ablation=coarse_ablation, return_hr_state=return_hr_state)
 
     def _forward_impl(self, image1, image2, iters=12, scale_iters=3,
                       test_mode=False, return_aux=False,
-                      coarse_ablation=None):
+                      coarse_ablation=None, return_hr_state=False):
         """Run CorGA, optionally intervening on the coarse-to-refine interface.
 
         ``coarse_ablation`` supports diagnostics and controlled ablation models.
@@ -253,6 +253,13 @@ class DEFOMStereo(CorGA):
         if test_mode:
             if disp_up is None:
                 disp_up = upflow(d0, factor=2 ** self.args.n_downsample)
+            if return_hr_state:
+                scale = 2 ** self.args.n_downsample
+                return disp_up, {
+                    "disp_lr_px": disp.float() * scale,
+                    "hidden_lr": refine_nets[0].float(),
+                    "context_lr": inp_4.float(),
+                }
             return disp_up
 
         if return_aux:

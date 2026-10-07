@@ -98,7 +98,7 @@ class MotionEncoder(nn.Module):
         motion_channels = hidden_dim // 2 * (1 + self.use_corr + self.use_warp_features)
         self.conv = nn.Conv2d(motion_channels, hidden_dim - 1, 3, padding=1)
 
-    def forward(self, corr, disp, warp_feat):
+    def forward(self, corr, disp, warp_feat, global_warp_feat=None):
         motion_features = []
         if self.use_corr:
             cor = F.relu(self.convc1(corr), True)
@@ -108,7 +108,10 @@ class MotionEncoder(nn.Module):
         dis = F.relu(self.convd2(dis), True)
         motion_features.append(dis)
         if self.use_warp_features:
-            war = F.relu(self.convg1(warp_feat), True)
+            war = self.convg1(warp_feat)
+            if global_warp_feat is not None:
+                war = war + self.global_convg1(global_warp_feat)
+            war = F.relu(war, True)
             war = F.relu(self.convg2(war), True)
             motion_features.append(war)
         out = F.relu(self.conv(torch.cat(motion_features, dim=1)), True)
@@ -168,7 +171,7 @@ class PromptStereoRecurrentUnit(nn.Module):
 
 
 class MultiPromptUpdateBlock(nn.Module):
-    def __init__(self, args, hidden_dim, feat_dim, volume_dim, warp_feat_dim, cor_planes=None, num_layers=None):
+    def __init__(self, args, hidden_dim, feat_dim, volume_dim, warp_feat_dim, cor_planes=None, num_layers=None, use_warp_features=True):
         """
         
         """
@@ -188,7 +191,7 @@ class MultiPromptUpdateBlock(nn.Module):
         self.structure_encoder = StructureEncoder(hidden_dim, 1)
         if cor_planes is None:
             cor_planes = args.corr_levels * (2*args.corr_radius + 1) * volume_dim
-        self.motion_encoder = MotionEncoder(hidden_dim, cor_planes, warp_feat_dim)
+        self.motion_encoder = MotionEncoder(hidden_dim, cor_planes, warp_feat_dim, use_warp_features=use_warp_features)
         self.disp_head = DispHead(hidden_dim)
         self.mask = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1),
@@ -211,7 +214,7 @@ class MultiPromptUpdateBlock(nn.Module):
         return F.relu(enc.convc2(c), True), normalize_disparity(mono_disp)[0]
 
     def forward(self, net, corr, disp, ctx, warp_feat, mono_disp,
-                static_features=None, need_mask=True):
+                static_features=None, need_mask=True, global_warp_feat=None):
         norm_mono = normalize_disparity(mono_disp)[0] if static_features is None else static_features[1]
         norm_disp, _, _ = normalize_disparity(disp)
         norm_res = norm_mono - norm_disp
@@ -222,7 +225,7 @@ class MultiPromptUpdateBlock(nn.Module):
             d = F.relu(enc.convd1(norm_res), True)
             d = F.relu(enc.convd2(d), True)
             structure = F.relu(enc.conv(torch.cat([static_features[0], d], dim=1)), True)
-        motion = self.motion_encoder(corr, disp, warp_feat)
+        motion = self.motion_encoder(corr, disp, warp_feat, global_warp_feat=global_warp_feat)
 
         if len(net) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} recurrent states, got {len(net)}")
